@@ -126,6 +126,10 @@ class IdentifyViewModel(app: Application) : AndroidViewModel(app) {
         sourceUris: List<String>,
         latitude: Double? = null,
         longitude: Double? = null,
+        /** Set when the user saved via "Not right?" and picked the actual
+         * species themselves, rather than "Save catch" on the model's own
+         * answer. (taxonId, scientificName). */
+        correction: Pair<Long, String>? = null,
         onSaved: (Long) -> Unit = {},
     ) {
         viewModelScope.launch(Dispatchers.IO) {
@@ -135,6 +139,7 @@ class IdentifyViewModel(app: Application) : AndroidViewModel(app) {
                 identification, stored,
                 latitude.takeIf { appCtx.settings.storeLocationWithCatches },
                 longitude.takeIf { appCtx.settings.storeLocationWithCatches },
+                correction = correction,
             )
             val id = appCtx.catchLog.insert(record)
             withContext(Dispatchers.Main) { onSaved(id) }

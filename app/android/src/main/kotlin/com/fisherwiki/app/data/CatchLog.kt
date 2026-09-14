@@ -301,18 +301,31 @@ class CatchLog(context: Context) {
     fun close() = helper.close()
 
     companion object {
-        /** Build a record from an identification result. */
+        /**
+         * Build a record from an identification result.
+         *
+         * @param correction the user's own pick, when they saved via "Not
+         *   right?" rather than "Save catch". Recorded as *corrected*, not as
+         *   what the model said: [identifiedTaxonId]/[identifiedName] always
+         *   preserve the model's original guess (or its coarse fallback),
+         *   even when the user disagreed with it from the very first save -
+         *   correction data is only useful for improving the model if it is
+         *   honest about what the model actually predicted.
+         */
         fun from(
             identification: Identification,
             photoPaths: List<String>,
             latitude: Double? = null,
             longitude: Double? = null,
+            correction: Pair<Long, String>? = null,
         ): CatchRecord = CatchRecord(
             photoPaths = photoPaths,
             identifiedTaxonId = identification.best?.taxon?.id
                 ?: identification.coarseFallback?.taxon?.id,
             identifiedName = identification.best?.taxon?.scientificName
                 ?: identification.coarseFallback?.taxon?.scientificName,
+            correctedTaxonId = correction?.first,
+            correctedName = correction?.second,
             certainty = identification.certainty.name,
             confidence = identification.best?.probability?.toDouble()
                 ?: identification.coarseFallback?.probability?.toDouble(),

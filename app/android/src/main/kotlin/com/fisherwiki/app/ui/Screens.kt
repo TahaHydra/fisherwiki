@@ -141,6 +141,7 @@ fun IdentifyScreen(
 ) {
     val state by vm.state.collectAsState()
     val photos by vm.photos.collectAsState()
+    var showCorrection by remember { mutableStateOf(false) }
 
     val pickImage = rememberLauncherForActivityResult(
         ActivityResultContracts.PickVisualMedia()
@@ -153,7 +154,7 @@ fun IdentifyScreen(
                     identification = s.identification,
                     detail = s.detail,
                     onOpenSpecies = onOpenSpecies,
-                    onCorrect = { /* correction sheet */ },
+                    onCorrect = { showCorrection = true },
                     onSave = {
                         vm.save(s.identification, s.photoPaths)
                         vm.clearPhotos()
@@ -161,6 +162,26 @@ fun IdentifyScreen(
                     modifier = Modifier.weight(1f),
                     hazards = s.hazards,
                 )
+
+                if (showCorrection) {
+                    CorrectionSheet(
+                        search = vm::searchSpecies,
+                        onPick = { taxon ->
+                            // The model's own answer is preserved by
+                            // CatchLog.from regardless - see its kdoc - so this
+                            // saves once, correctly, rather than saving the
+                            // model's guess now and correcting a second write
+                            // later.
+                            vm.save(
+                                s.identification, s.photoPaths,
+                                correction = taxon.id to taxon.scientificName,
+                            )
+                            vm.clearPhotos()
+                            showCorrection = false
+                        },
+                        onDismiss = { showCorrection = false },
+                    )
+                }
             }
 
             is IdentifyViewModel.State.Working -> Box(
