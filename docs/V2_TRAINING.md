@@ -226,7 +226,33 @@ which is why the derivative size matters as much as the GPU does.
 
 ---
 
-## 8. What is not built yet
+## 8. Scale, corrected
+
+The tables above are quoted per 2M and 3M images because that was the original
+target. It is not reachable: the entire admissible pool is **505,347 images**,
+measured from the source rather than assumed — see
+[`V2_DATA_CEILING.md`](V2_DATA_CEILING.md). At the realistic ~490k corpus:
+
+| resolution | img/s | epoch @490k |
+|---|---:|---:|
+| 320 | 104.6 | **1.3 h** |
+| 384 | 76.5 | 1.8 h |
+| 448 | 57.6 | 2.4 h |
+| progressive 320→384→448 | ~86 blended | **~1.6 h** |
+
+A 15-epoch run is roughly **24 hours of GPU time** — two or three nights, not a
+month. Two consequences:
+
+* The multi-GPU cloud path is **not needed for the first V2 model**. The code is
+  written and tested and stays useful for a later corpus, but renting 8×4090 to
+  train on 490k images buys waiting less, not training better.
+* Headroom exists to spend compute on *quality* instead of throughput: a larger
+  backbone, higher final resolution, or longer training all become affordable in
+  a way they were not at 3M.
+
+---
+
+## 9. What is not built yet
 
 * **The detector.** The schema hook and crop path exist (`detections` table,
   `--crop-pad`); no boxes have been generated, so shards currently store whole
