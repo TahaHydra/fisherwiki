@@ -7,4 +7,10 @@
 <paths>
     <files-path name="catch_photos" path="catches/" />
     <cache-path name="exports" path="exports/" />
+    <!-- Destination for ACTION_IMAGE_CAPTURE before the user has decided to
+         keep or discard the shot. Files here are not catch photos yet - a
+         copy only happens on save(), same as a gallery pick - so this is
+         scoped to the cache, not files/catches/, and is cleared on cold
+         start in IdentifyViewModel. -->
+    <cache-path name="camera_capture" path="camera/" />
 </paths>

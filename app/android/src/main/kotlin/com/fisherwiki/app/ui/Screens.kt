@@ -1,6 +1,9 @@
 package com.fisherwiki.app.ui
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -41,13 +44,65 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
+import com.fisherwiki.app.BuildConfig
 import com.fisherwiki.app.FisherWikiApplication
 import com.fisherwiki.app.data.PackManager
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 private fun app(ctx: android.content.Context) = ctx.applicationContext as FisherWikiApplication
+
+/**
+ * A fresh, writable destination for [ActivityResultContracts.TakePicture],
+ * exposed to the system camera app through [FileProvider] - the same
+ * mechanism `installFromUri`/export already trust for content:// access, and
+ * the reason `file_paths.xml` has a `camera_capture` cache path scoped
+ * separately from catch photos: this file is not a catch yet, and is only
+ * ever promoted to one through the ordinary save() path, same as a gallery
+ * pick.
+ */
+private fun newCameraCaptureUri(ctx: android.content.Context): Uri {
+    val dir = File(ctx.cacheDir, "camera").apply { mkdirs() }
+    val file = File(dir, "capture_${System.currentTimeMillis()}.jpg")
+    return FileProvider.getUriForFile(ctx, "${BuildConfig.APPLICATION_ID}.fileprovider", file)
+}
+
+/**
+ * A cached fix, not a fresh one - this app never calls `requestLocationUpdates`
+ * and never will, because a ranking hint does not justify the battery cost or
+ * the privacy posture of continuous location. `getLastKnownLocation` returns
+ * whatever the OS already has cached from other apps/services, which is
+ * `null` more often on a device that has not used location recently; that is
+ * an acceptable, honest trade for "works without it".
+ *
+ * Caller must already hold ACCESS_COARSE_LOCATION (or FINE) - this does not
+ * check, because by the time it is called permission has just been confirmed
+ * either via ContextCompat.checkSelfPermission or the request callback.
+ */
+@Suppress("MissingPermission")
+private fun lastKnownLocation(
+    ctx: android.content.Context,
+): com.fisherwiki.core.rank.CandidateRanker.Location? {
+    val lm = ctx.getSystemService(android.content.Context.LOCATION_SERVICE)
+        as? android.location.LocationManager ?: return null
+    val providers = listOf(
+        android.location.LocationManager.GPS_PROVIDER,
+        android.location.LocationManager.NETWORK_PROVIDER,
+        android.location.LocationManager.PASSIVE_PROVIDER,
+    )
+    for (provider in providers) {
+        val loc = runCatching { lm.getLastKnownLocation(provider) }.getOrNull()
+        if (loc != null) {
+            return com.fisherwiki.core.rank.CandidateRanker.Location(
+                loc.latitude, loc.longitude
+            )
+        }
+    }
+    return null
+}
 
 @Composable
 fun HomeScreen(
@@ -142,10 +197,124 @@ fun IdentifyScreen(
     val state by vm.state.collectAsState()
     val photos by vm.photos.collectAsState()
     var showCorrection by remember { mutableStateOf(false) }
+    val ctx = LocalContext.current
 
     val pickImage = rememberLauncherForActivityResult(
         ActivityResultContracts.PickVisualMedia()
     ) { uri -> uri?.let { vm.addPhoto(it) } }
+
+    // TakePicture's callback reports only success/failure, not which Uri -
+    // it was always going to be the one we handed it when launching, so that
+    // has to be remembered across the round trip to the camera app and back.
+    var pendingCaptureUri by remember { mutableStateOf<Uri?>(null) }
+    val takePicture = rememberLauncherForActivityResult(
+        ActivityResultContracts.TakePicture()
+    ) { captured ->
+        val uri = pendingCaptureUri
+        pendingCaptureUri = null
+        if (uri == null) return@rememberLauncherForActivityResult
+        if (captured) {
+            vm.addPhoto(uri)
+        } else {
+            // Cancelled from the camera app. It may have already created an
+            // empty file at the destination we gave it; nothing else will
+            // ever clean that up, and it is not a catch photo.
+            runCatching { ctx.contentResolver.delete(uri, null, null) }
+        }
+    }
+    val requestCameraPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        // Denied: no-op, deliberately. The button stays where it was; the
+        // system's own "don't ask again" / settings flow handles the rest,
+        // the same as it would for any other app.
+        if (granted) {
+            val uri = newCameraCaptureUri(ctx)
+            pendingCaptureUri = uri
+            takePicture.launch(uri)
+        }
+    }
+
+    fun startCameraCapture() {
+        val alreadyGranted = androidx.core.content.ContextCompat.checkSelfPermission(
+            ctx, Manifest.permission.CAMERA
+        ) == PackageManager.PERMISSION_GRANTED
+        if (alreadyGranted) {
+            val uri = newCameraCaptureUri(ctx)
+            pendingCaptureUri = uri
+            takePicture.launch(uri)
+        } else {
+            requestCameraPermission.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    // Location is opt-in (Settings.useLocation, default false) and coarse is
+    // deliberately all this ever asks for: it is a ranking hint, bounded and
+    // attenuated by GeoPrior so it can never zero a species out (see its
+    // kdoc), not a feature that needs metre-level precision. Denial is not an
+    // error path - identify() runs with location = null exactly as it always
+    // has, which is the whole point of "identification works fully without
+    // it" being true rather than aspirational.
+    val requestLocationPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        vm.identify(if (granted) lastKnownLocation(ctx) else null)
+    }
+    // docs/PRIVACY.md §4 promises the app "explains what it does with it" when
+    // it first asks for location - that is this dialog, not the bare system
+    // permission prompt, which says nothing about *why*. Shown once
+    // (locationRationaleShown), so turning the setting back on after an
+    // earlier denial goes straight to the system prompt rather than nagging.
+    var showLocationRationale by remember { mutableStateOf(false) }
+
+    fun identifyNow() {
+        val settings = app(ctx).settings
+        if (!settings.useLocation) {
+            vm.identify()
+            return
+        }
+        val alreadyGranted = androidx.core.content.ContextCompat.checkSelfPermission(
+            ctx, Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        when {
+            alreadyGranted -> vm.identify(lastKnownLocation(ctx))
+            !settings.locationRationaleShown -> showLocationRationale = true
+            else -> requestLocationPermission.launch(Manifest.permission.ACCESS_COARSE_LOCATION)
+        }
+    }
+
+    if (showLocationRationale) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = {
+                showLocationRationale = false
+                app(ctx).settings.locationRationaleShown = true
+                vm.identify()
+            },
+            title = { Text("Use your location?") },
+            text = {
+                Text(
+                    "Knowing roughly where you are lets the app favour species " +
+                        "actually found nearby. It never overrides what the photo " +
+                        "shows, works fine if you say no, and your location is " +
+                        "never sent anywhere - it only ever stays on this phone."
+                )
+            },
+            confirmButton = {
+                Button(onClick = {
+                    showLocationRationale = false
+                    app(ctx).settings.locationRationaleShown = true
+                    requestLocationPermission.launch(Manifest.permission.ACCESS_COARSE_LOCATION)
+                }) { Text("Allow") }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = {
+                    showLocationRationale = false
+                    app(ctx).settings.locationRationaleShown = true
+                    vm.identify()
+                }) { Text("Not now") }
+            },
+        )
+    }
 
     Column(Modifier.fillMaxSize()) {
         when (val s = state) {
@@ -238,6 +407,15 @@ fun IdentifyScreen(
                 )
                 Spacer(Modifier.height(24.dp))
                 Button(
+                    onClick = { startCameraCapture() },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Icon(Icons.Default.PhotoCamera, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Take a photo")
+                }
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(
                     onClick = {
                         pickImage.launch(
                             androidx.activity.result.PickVisualMediaRequest(
@@ -255,7 +433,7 @@ fun IdentifyScreen(
                     Spacer(Modifier.height(16.dp))
                     Text("${photos.size} photo(s) selected")
                     Spacer(Modifier.height(8.dp))
-                    Button(onClick = { vm.identify() }, Modifier.fillMaxWidth()) {
+                    Button(onClick = { identifyNow() }, Modifier.fillMaxWidth()) {
                         Text("Identify")
                     }
                 }
