@@ -50,6 +50,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,12 +82,118 @@ class Sample:
     group_id: str
 
 
-class ShardWriter:
-    """Writes samples into tar shards and accumulates the index.
+def shard_sidecar(shard_path: Path) -> Path:
+    """Durable per-shard index, written when that shard is finalised."""
+    return Path(str(shard_path) + ".idx.parquet")
 
-    Crash behaviour is deliberate: a shard is written to `.tmp` and renamed
-    only once its index rows are complete, so an interrupted preparation run
-    leaves no half-shard that a later run would treat as finished.
+
+def _write_table(rows: list[dict], path: Path) -> None:
+    """Write index rows atomically: temp file, then rename."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pa.table({c: pa.array([r[c] for r in rows]) for c in INDEX_COLUMNS})
+    tmp = Path(str(path) + ".tmp")
+    pq.write_table(table, tmp, compression="zstd")
+    tmp.replace(path)
+
+
+def scan_finalised(out_dir: Path) -> dict:
+    """What a previous run already finished in ``out_dir``.
+
+    Only ``.tar`` files count. A ``.tar.tmp`` is by definition an interrupted
+    shard and is never treated as work done - it is removed and its samples are
+    prepared again, which costs at most one shard.
+    """
+    out_dir = Path(out_dir)
+    if not out_dir.exists():
+        return {"shards": [], "keys": set(), "next_index": 0, "stale_tmp": []}
+    shards = sorted(out_dir.glob("*.tar"))
+    keys = set()
+    for s in shards:
+        side = shard_sidecar(s)
+        if side.exists():
+            import pyarrow.parquet as pq
+
+            keys.update(pq.read_table(side, columns=["key"]).column("key").to_pylist())
+    highest = -1
+    for s in shards:
+        try:
+            highest = max(highest, int(s.name[:-4].rsplit("-", 1)[1]))
+        except (IndexError, ValueError):
+            continue
+    return {
+        "shards": shards,
+        "keys": keys,
+        "next_index": highest + 1,
+        "stale_tmp": sorted(out_dir.glob("*.tar.tmp")),
+    }
+
+
+def adopt_shard(shard_path: Path, lookup) -> int:
+    """Write a sidecar index for a finalised shard that has none.
+
+    The first implementation kept every index row in RAM and wrote one combined
+    ``index.parquet`` only when the writer closed, so an interrupted run left
+    valid tar files that nothing could describe. Rather than discard hours of
+    work, the index is reconstructed from the shard itself: a tar records every
+    member's name and payload offset, and ``lookup`` supplies the labels for a
+    key from the provenance store.
+
+    The shards were always recoverable - but only because tar is a transparent
+    format, which is not a property to rely on twice.
+    """
+    rows = []
+    with tarfile.open(shard_path, "r") as tar:
+        for info in tar:
+            if not info.isfile():
+                continue
+            key = info.name.rsplit(".", 1)[0]
+            meta = lookup(key)
+            if meta is None:
+                continue
+            rows.append({
+                "key": key,
+                "shard": shard_path.name,
+                "offset": info.offset_data,
+                "length": info.size,
+                "class_id": int(meta["class_id"]),
+                "taxon_id": int(meta["taxon_id"]),
+                "sha256": meta.get("sha256") or key,
+                "split": meta["split"],
+                "group_id": meta["group_id"],
+            })
+    if rows:
+        _write_table(rows, shard_sidecar(shard_path))
+    return len(rows)
+
+
+def rebuild_index(out_dir: Path) -> Path:
+    """Combine every sidecar into the ``index.parquet`` that readers expect."""
+    out_dir = Path(out_dir)
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    tables = [pq.read_table(shard_sidecar(s))
+              for s in sorted(out_dir.glob("*.tar")) if shard_sidecar(s).exists()]
+    path = out_dir / "index.parquet"
+    if not tables:
+        return path
+    tmp = Path(str(path) + ".tmp")
+    pq.write_table(pa.concat_tables(tables), tmp, compression="zstd")
+    tmp.replace(path)
+    return path
+
+
+class ShardWriter:
+    """Writes samples into tar shards, finalising each one durably.
+
+    Every finalised shard gets its own sidecar index, written atomically as soon
+    as the tar is renamed into place. That is what makes preparation resumable:
+    the first implementation accumulated index rows in RAM and wrote one
+    combined file at close, so stopping a long run near the end left valid tars
+    and no index. Per-shard state means an interruption costs at most the shard
+    in flight.
     """
 
     def __init__(
@@ -95,17 +202,19 @@ class ShardWriter:
         *,
         prefix: str = "fw",
         shard_size: int = DEFAULT_SHARD_SIZE,
+        start_index: int = 0,
     ) -> None:
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.prefix = prefix
         self.shard_size = int(shard_size)
         self.rows: list[dict] = []
-        self._tar: tarfile.TarFile | None = None
-        self._tmp_path: Path | None = None
-        self._shard_name: str | None = None
+        self._shard_rows: list[dict] = []
+        self._tar = None
+        self._tmp_path = None
+        self._shard_name = None
         self._n_in_shard = 0
-        self._shard_index = 0
+        self._shard_index = int(start_index)
 
     # -- shard lifecycle ------------------------------------------------
     def _open_shard(self) -> None:
@@ -113,13 +222,26 @@ class ShardWriter:
         self._tmp_path = self.out_dir / (self._shard_name + ".tmp")
         self._tar = tarfile.open(self._tmp_path, "w")
         self._n_in_shard = 0
+        self._shard_rows = []
 
     def _close_shard(self) -> None:
         if self._tar is None:
             return
+        # Flush and fsync before the rename is allowed to make it look
+        # finished. A rename is atomic, but renaming a file whose bytes are
+        # still in the page cache only makes the truncation atomic too.
+        try:
+            self._tar.fileobj.flush()
+            os.fsync(self._tar.fileobj.fileno())
+        except (AttributeError, OSError):
+            pass
         self._tar.close()
-        assert self._tmp_path is not None and self._shard_name is not None
-        self._tmp_path.replace(self.out_dir / self._shard_name)
+        final = self.out_dir / self._shard_name
+        self._tmp_path.replace(final)
+        if self._shard_rows:
+            _write_table(self._shard_rows, shard_sidecar(final))
+        self.rows.extend(self._shard_rows)
+        self._shard_rows = []
         self._tar = None
         self._tmp_path = None
         self._shard_index += 1
@@ -127,7 +249,6 @@ class ShardWriter:
     def write(self, sample: Sample) -> None:
         if self._tar is None:
             self._open_shard()
-        assert self._tar is not None and self._shard_name is not None
 
         info = tarfile.TarInfo(name=f"{sample.key}.jpg")
         info.size = len(sample.data)
@@ -144,7 +265,7 @@ class ShardWriter:
         padded = ((len(sample.data) + 511) // 512) * 512
         data_offset = self._tar.offset - padded
 
-        self.rows.append({
+        self._shard_rows.append({
             "key": sample.key,
             "shard": self._shard_name,
             "offset": data_offset,
@@ -161,17 +282,9 @@ class ShardWriter:
 
     def close(self) -> dict:
         self._close_shard()
-        index_path = self.out_dir / "index.parquet"
-        if self.rows:
-            import pyarrow as pa
-            import pyarrow.parquet as pq
-
-            table = pa.table({
-                c: pa.array([r[c] for r in self.rows]) for c in INDEX_COLUMNS
-            })
-            tmp = index_path.with_suffix(".parquet.tmp")
-            pq.write_table(table, tmp, compression="zstd")
-            tmp.replace(index_path)
+        # Rebuilt from the sidecars rather than from self.rows, so a resumed run
+        # produces an index covering shards this process never wrote.
+        index_path = rebuild_index(self.out_dir)
         return {
             "shards": self._shard_index,
             "samples": len(self.rows),

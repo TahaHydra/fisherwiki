@@ -78,7 +78,14 @@ def build(
     from PIL import Image
 
     from fwml.crop_v2 import expand_box, grow_box_to_min
-    from fwml.shards import Sample, ShardWriter, write_manifest
+    from fwml.shards import (
+        Sample,
+        ShardWriter,
+        adopt_shard,
+        scan_finalised,
+        shard_sidecar,
+        write_manifest,
+    )
 
     con = duckdb.connect(str(db_path or PATHS.provenance_db), read_only=True)
     has_detections = con.execute(
@@ -142,6 +149,49 @@ def build(
     failures = 0
     t0 = time.time()
 
+    # --- resume -----------------------------------------------------------
+    # Look at what a previous run finished before preparing anything. Finalised
+    # shards are kept and their samples skipped; only a `.tar.tmp` - a shard
+    # interrupted mid-write - is discarded, costing at most one shard.
+    meta_by_key = {
+        r[0]: {"class_id": class_of[r[2]], "taxon_id": int(r[2]),
+               "split": r[1], "group_id": r[3], "sha256": r[0]}
+        for r in rows
+    }
+    done_keys: set[str] = set()
+    start_index: dict[str, int] = {}
+    adopted = 0
+    for split in splits:
+        state = scan_finalised(out_dir / split)
+        start_index[split] = state["next_index"]
+        for stale in state["stale_tmp"]:
+            log(f"  discarding interrupted shard {stale.name}")
+            stale.unlink(missing_ok=True)
+        # Shards written before per-shard indexes existed have valid tars and no
+        # sidecar. Reconstruct the sidecar from the tar rather than redo the
+        # work: a tar records every member name and payload offset, and the
+        # labels come from the corpus rows already loaded above.
+        for shard in state["shards"]:
+            if not shard_sidecar(shard).exists():
+                adopted += adopt_shard(shard, meta_by_key.get)
+        if adopted:
+            # Re-scan so the freshly written sidecars are picked up.
+            state = scan_finalised(out_dir / split)
+            start_index[split] = state["next_index"]
+        done_keys |= state["keys"]
+        if state["shards"]:
+            log(f"  {split}: {len(state['shards'])} finalised shards, "
+                f"{len(state['keys']):,} samples already done, "
+                f"next shard {start_index[split]:05d}")
+    if adopted:
+        log(f"  adopted {adopted:,} samples from shards written before "
+            f"per-shard indexes existed")
+    if done_keys:
+        before = len(rows)
+        rows = [r for r in rows if r[0] not in done_keys]
+        log(f"  resuming: {before - len(rows):,} samples already prepared, "
+            f"{len(rows):,} remaining")
+
     writers: dict[str, ShardWriter] = {}
     try:
         for i, (sha, split, taxon, group_id, cas_path, _name,
@@ -194,7 +244,8 @@ def build(
             writer = writers.get(split)
             if writer is None:
                 writer = ShardWriter(out_dir / split, prefix=split,
-                                     shard_size=shard_size)
+                                     shard_size=shard_size,
+                                     start_index=start_index.get(split, 0))
                 writers[split] = writer
             import hashlib
 
