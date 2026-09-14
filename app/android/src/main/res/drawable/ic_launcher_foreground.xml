@@ -1,0 +1,11 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <!-- Simple fish silhouette. -->
+    <path android:fillColor="#F2F7FA"
+        android:pathData="M30,54 C36,42 50,36 62,40 C70,43 74,49 76,54 C74,59 70,65 62,68 C50,72 36,66 30,54 Z" />
+    <path android:fillColor="#F2F7FA"
+        android:pathData="M76,54 L86,46 L84,54 L86,62 Z" />
+    <path android:fillColor="#0E3A53"
+        android:pathData="M56,50 m-2.5,0 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0" />
+</vector>

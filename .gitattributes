@@ -1,0 +1,13 @@
+# Normalise to LF in the repository; Git checks out with native endings.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.onnx binary
+*.tflite binary
+*.sqlite binary
+*.parquet binary
+*.jar binary
+*.fwpack binary
+gradlew text eol=lf
+*.bat text eol=crlf

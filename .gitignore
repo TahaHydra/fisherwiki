@@ -1,0 +1,81 @@
+# ---------------------------------------------------------------------------
+# FisherWiki .gitignore
+#
+# Rule: the repository holds code, configuration, manifests and hashes.
+# It never holds images, bulk dumps, model weights or training artefacts.
+# Those live under $FISHERWIKI_DATA (see tools/fwdata/config.py).
+# ---------------------------------------------------------------------------
+
+# Python environments / caches
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# Local data root fallback (when D:/E: are unavailable)
+.data/
+data/raw/
+data/cas/
+data/work/
+data/artifacts/
+
+# Bulk data & model artefacts, wherever they land
+*.csv.gz
+*.tar.gz
+*.zip
+*.duckdb
+*.duckdb.wal
+*.parquet
+*.onnx
+*.tflite
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+# ...except small binary test fixtures required for the Kotlin test suite to
+# run at all (PreprocessorParityTest, GeoPriorRoundTripTest). Without these,
+# a clean clone fails two tests with "missing from test resources".
+!app/core/src/test/resources/fixtures/*.bin
+
+# Built packs (large); pack *manifests* are tracked, payloads are not
+packs/**/*.fwpack
+packs/**/model.onnx
+packs/**/species.sqlite
+packs/**/*.bin
+
+# Logs and scratch
+*.log
+.scratch/
+scratch/
+tmp/
+
+# Android / Gradle
+.gradle/
+.kotlin/
+app/build/
+app/*/build/
+build/
+local.properties
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+*.jks
+*.keystore
+!app/debug.keystore
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

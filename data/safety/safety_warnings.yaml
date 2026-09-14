@@ -1,0 +1,256 @@
+# Curated fish handling-safety warnings.
+#
+# ---------------------------------------------------------------------------
+# EDITORIAL RULES - read before adding anything
+# ---------------------------------------------------------------------------
+#
+# 1. Every entry cites a named source. No entry may be added because it is
+#    "common knowledge"; if it cannot be cited it does not ship.
+#
+# 2. Claims are made at the taxonomic rank the evidence actually supports.
+#    Smith & Wheeler (2006) establish venom at the level of lineages, so these
+#    are mostly family- and genus-level claims, applied to all members. Where a
+#    family is mixed, the entry says so in `detail` rather than overstating.
+#
+# 3. **Absence of an entry is not a claim of safety.** The app renders a species
+#    with no warning as having no *recorded* warning, and never as "safe to
+#    handle". A great many fish can injure you in ways nobody has catalogued.
+#
+# 4. Severity vocabulary is closed:
+#       danger  - can cause serious injury or is potentially lethal
+#       caution - painful or injurious, unlikely to be life-threatening
+#       info    - worth knowing, not an injury risk
+#
+# 5. Prefer under-claiming. A missing warning is bad; a wrong warning that
+#    erodes trust in the warnings that matter is worse.
+#
+# This file is loaded by tools/fwdata/safety.py and validated against the
+# sources table before it can enter a pack.
+
+sources:
+  - source_id: smith-wheeler-2006
+    title: >-
+      Venom Evolution Widespread in Fishes: A Phylogenetic Road Map for the
+      Bioprospecting of Piscine Venoms
+    publisher: Journal of Heredity 97(3):206-217
+    url: https://doi.org/10.1093/jhered/esj034
+    license: CITATION-ONLY
+    retrieved_on: "2026-09-13"
+    citation: >-
+      Smith, W.L. and Wheeler, W.C. (2006). Venom Evolution Widespread in
+      Fishes: A Phylogenetic Road Map for the Bioprospecting of Piscine Venoms.
+      Journal of Heredity 97(3): 206-217. doi:10.1093/jhered/esj034
+    notes: >-
+      Phylogenetic survey establishing venom across spiny-rayed fish lineages;
+      the standard reference for which fish groups are venomous. Cited as a
+      source for factual claims; no text is reproduced from it.
+
+  - source_id: fisherwiki-curated
+    title: FisherWiki curated handling notes
+    publisher: FisherWiki
+    url: https://github.com/fisherwiki/fisherwiki
+    license: CC-BY-4.0
+    retrieved_on: "2026-09-13"
+    citation: >-
+      FisherWiki curated handling notes, reviewed against the cited primary
+      literature. See data/safety/safety_warnings.yaml.
+    notes: >-
+      Wording of the practical handling advice. The underlying biological claim
+      always carries its own source; this source covers only the phrasing.
+
+warnings:
+  # --- venomous spines: high severity -------------------------------------
+  - rank: family
+    taxon: Synanceiidae
+    kind: venomous_spines
+    severity: danger
+    summary: >-
+      Stonefishes have highly venomous dorsal spines. Envenomation is a medical
+      emergency.
+    detail: >-
+      Among the most venomous fishes known. Do not handle. Seek immediate
+      medical attention; antivenom exists in some regions.
+    source_id: smith-wheeler-2006
+
+  - rank: family
+    taxon: Scorpaenidae
+    kind: venomous_spines
+    severity: danger
+    summary: >-
+      Scorpionfishes and lionfishes have venomous dorsal, pelvic and anal fin
+      spines.
+    detail: >-
+      Stings are intensely painful and can cause swelling and systemic symptoms.
+      Handle only with thick gloves, or not at all. Hot-water immersion is the
+      usual first aid; seek medical attention.
+    source_id: smith-wheeler-2006
+
+  - rank: family
+    taxon: Trachinidae
+    kind: venomous_spines
+    severity: danger
+    summary: >-
+      Weeverfishes have venomous dorsal and opercular spines and bury themselves
+      in sand.
+    detail: >-
+      A common cause of injury to waders on European coasts. The sting is
+      severely painful. Hot-water immersion is the usual first aid; seek medical
+      attention.
+    source_id: smith-wheeler-2006
+
+  - rank: family
+    taxon: Dasyatidae
+    kind: venomous_spines
+    severity: danger
+    summary: Stingrays carry a venomous barb on the tail.
+    detail: >-
+      The barb can inflict a deep laceration as well as envenomation. Never
+      handle by the tail. Penetrating wounds to the torso are life-threatening
+      and require emergency care.
+    source_id: smith-wheeler-2006
+
+  - rank: family
+    taxon: Myliobatidae
+    kind: venomous_spines
+    severity: danger
+    summary: Eagle rays carry one or more venomous tail spines.
+    detail: Same handling precautions as other stingrays.
+    source_id: smith-wheeler-2006
+
+  # --- venomous spines: painful but rarely dangerous ----------------------
+  - rank: family
+    taxon: Siganidae
+    kind: venomous_spines
+    severity: caution
+    summary: Rabbitfishes have venomous dorsal, pelvic and anal fin spines.
+    detail: Stings are painful but usually not dangerous. Handle with gloves.
+    source_id: smith-wheeler-2006
+
+  - rank: family
+    taxon: Batrachoididae
+    kind: venomous_spines
+    severity: caution
+    summary: Many toadfishes have venomous dorsal and opercular spines.
+    detail: >-
+      Venom is present in some but not all members of this family. Treat any
+      toadfish as venomous and handle with gloves.
+    source_id: smith-wheeler-2006
+
+  - rank: order
+    taxon: Siluriformes
+    kind: venomous_spines
+    severity: caution
+    summary: >-
+      Many catfishes have serrated pectoral and dorsal spines, venomous in a
+      large number of families.
+    detail: >-
+      The spine wound itself is the main hazard even where venom is absent, and
+      wounds readily become infected. Grip behind the pectoral fins or use a
+      landing mat. Venom is widespread but not universal across the order.
+    source_id: smith-wheeler-2006
+
+  - rank: family
+    taxon: Chimaeridae
+    kind: venomous_spines
+    severity: caution
+    summary: Chimaeras have a venomous spine in front of the first dorsal fin.
+    detail: Handle away from the dorsal spine.
+    source_id: smith-wheeler-2006
+
+  - rank: family
+    taxon: Acanthuridae
+    kind: sharp_spine
+    severity: caution
+    summary: >-
+      Surgeonfishes have a blade-like spine on each side of the caudal peduncle.
+    detail: >-
+      Sharp enough to cause deep cuts; some species are additionally venomous.
+      Avoid gripping near the tail.
+    source_id: smith-wheeler-2006
+
+  # --- toxic flesh ---------------------------------------------------------
+  - rank: family
+    taxon: Tetraodontidae
+    kind: toxic_flesh
+    severity: danger
+    summary: >-
+      Pufferfishes commonly contain tetrodotoxin in the liver, gonads, skin and
+      sometimes flesh. Do not eat.
+    detail: >-
+      Tetrodotoxin is not destroyed by cooking and there is no antidote.
+      Preparation is restricted to specially licensed chefs in the few countries
+      where it is eaten at all. Handling is not dangerous; eating is.
+    source_id: fisherwiki-curated
+
+  - rank: family
+    taxon: Diodontidae
+    kind: toxic_flesh
+    severity: danger
+    summary: Porcupinefishes may contain tetrodotoxin. Do not eat.
+    detail: As for pufferfishes; cooking does not destroy the toxin.
+    source_id: fisherwiki-curated
+
+  - rank: family
+    taxon: Ostraciidae
+    kind: toxic_flesh
+    severity: caution
+    summary: >-
+      Boxfishes release a toxin (ostracitoxin) from the skin when stressed.
+    detail: >-
+      Primarily a hazard to other fish in a confined space such as a live well
+      or bucket. Not considered good eating.
+    source_id: fisherwiki-curated
+
+  # --- bite injury ---------------------------------------------------------
+  - rank: family
+    taxon: Muraenidae
+    kind: bite
+    severity: danger
+    summary: Moray eels bite hard, hold on, and the wounds infect readily.
+    detail: >-
+      Backward-pointing teeth make a bite difficult to release. Keep hands clear
+      of the head and use long-nosed pliers to remove hooks.
+    source_id: fisherwiki-curated
+
+  - rank: family
+    taxon: Sphyraenidae
+    kind: bite
+    severity: caution
+    summary: Barracudas have large, sharp teeth.
+    detail: Keep hands clear of the mouth; unhook with pliers.
+    source_id: fisherwiki-curated
+
+  - rank: family
+    taxon: Esocidae
+    kind: bite
+    severity: caution
+    summary: >-
+      Pike and muskellunge have numerous sharp teeth and strong jaws.
+    detail: >-
+      Use a proper unhooking mat, long forceps and jaw spreaders. Chin-grip from
+      under the gill plate, avoiding the gill rakers - this protects the fish as
+      well as your hand.
+    source_id: fisherwiki-curated
+
+  - rank: class
+    taxon: Chondrichthyes
+    kind: handling
+    severity: caution
+    summary: >-
+      Sharks and rays have abrasive skin, and sharks have teeth capable of
+      serious injury.
+    detail: >-
+      Even small sharks can inflict deep wounds. Support large specimens
+      horizontally, keep clear of the mouth and, on rays, the tail.
+    source_id: fisherwiki-curated
+
+  # --- informational -------------------------------------------------------
+  - rank: family
+    taxon: Anguillidae
+    kind: handling
+    severity: info
+    summary: Eels are extremely slippery and difficult to hold.
+    detail: >-
+      A wet cloth gives a secure grip without stripping the protective slime
+      coat. They will also tie themselves into knots around your line.
+    source_id: fisherwiki-curated

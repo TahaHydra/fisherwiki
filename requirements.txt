@@ -1,0 +1,10 @@
+# Data acquisition, provenance and pack tooling (.venv).
+# Pinned to the versions this project was built and tested against.
+duckdb==1.5.5
+pyarrow==25.0.1
+requests==2.32.3
+numpy==2.5.3
+pillow==12.3.0
+pyyaml==6.0.2
+tqdm==4.67.1
+pytest==8.3.4

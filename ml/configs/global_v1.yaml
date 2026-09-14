@@ -1,0 +1,25 @@
+# Global angler model: every species with enough evidence to justify a
+# species-level claim. See docs/MODEL.md for why one global model beats
+# per-region models here (the regions overlap heavily, and the union of
+# per-region class lists is larger than the global list).
+corpus: global_v1
+backbone: mobilenet_v3_large
+image_size: 224
+batch_size: 96
+epochs: 30
+lr: 0.003
+weight_decay: 0.00002
+warmup_epochs: 2
+label_smoothing: 0.1
+genus_loss_weight: 0.2
+family_loss_weight: 0.1
+embedding_dim: 256
+dropout: 0.2
+amp: true            # mandatory on ROCm/Windows: fp32 GEMM is 25x slower there
+workers: 8
+seed: 1337
+pretrained: true
+grad_clip: 1.0
+balanced_sampling: true
+freeze_backbone_epochs: 1
+early_stop_patience: 8

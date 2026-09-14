@@ -1,0 +1,15 @@
+# Fast end-to-end sanity run. Not a model anyone should ship; its only job is
+# to prove the whole pipeline executes and produces a usable artefact.
+corpus: global_v1
+backbone: mobilenet_v3_small
+image_size: 160
+batch_size: 64
+epochs: 2
+lr: 0.004
+warmup_epochs: 0
+workers: 6
+seed: 7
+pretrained: true
+freeze_backbone_epochs: 0
+early_stop_patience: 0
+balanced_sampling: true

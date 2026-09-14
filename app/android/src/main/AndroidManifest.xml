@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+      Permission policy, and the reasoning for each entry, is the privacy
+      contract of this app. See docs/PRIVACY.md.
+
+      NOT requested, deliberately:
+
+        INTERNET - not requested. This app contains no HTTP client and no
+        networking library; packs are installed from a file the user chooses.
+        The permission was declared earlier for a pack downloader that was
+        never built, which made the privacy documentation describe traffic
+        that could not occur. An app without INTERNET cannot open a socket at
+        all - the platform enforces it - so removing it turns a promise in a
+        document into a property anyone can verify from this file in seconds.
+        Re-add it only alongside an actual downloader, as a visible change.
+
+        ACCESS_NETWORK_STATE - not requested; nothing here uses the network.
+        ACCESS_BACKGROUND_LOCATION - never. Location is read once, on demand.
+        READ_CONTACTS / READ_PHONE_STATE / GET_ACCOUNTS - never.
+    -->
+
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!--
+      onnxruntime-android declares INTERNET and ACCESS_NETWORK_STATE in its own
+      manifest, so the merger grants them to every app that links it - including
+      this one, whose entire premise is that it cannot send your photograph
+      anywhere. Verified against the built APK, not the source manifest: before
+      these two lines the shipped artefact held both permissions despite this
+      file requesting neither.
+
+      Inference is a local file read and a matmul; it does not need a socket.
+      If some future version of the runtime genuinely requires one, it will fail
+      loudly with a SecurityException rather than quietly gaining the ability to
+      talk to a server, which is the right way round for this app.
+
+      scripts/check_apk_permissions.py enforces this against the APK.
+    -->
+    <uses-permission android:name="android.permission.INTERNET"
+        tools:node="remove" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"
+        tools:node="remove" />
+
+    <!--
+      Coarse location is optional and only ever improves candidate *ranking*.
+      The app is fully functional when it is denied; see GeoPrior in :core.
+      Fine location is requested too because a river vs estuary distinction can
+      matter, but the app never stores or transmits it without an explicit
+      user export.
+    -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+    <!-- Importing an existing photo from the gallery. Scoped by design. -->
+    <uses-permission
+        android:name="android.permission.READ_MEDIA_IMAGES"
+        android:minSdkVersion="33" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.location.gps" android:required="false" />
+
+    <application
+        android:name=".FisherWikiApplication"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.FisherWiki"
+        tools:targetApi="36">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- Sideloading a pack during development: open a .fwpack file. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:mimeType="application/octet-stream" />
+                <data android:host="*" />
+                <data android:pathPattern=".*\\.fwpack" />
+            </intent-filter>
+        </activity>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>

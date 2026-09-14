@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Only the app's own private directories are exposed, and only so the user can
+  share a photo or an export they explicitly chose to share. Nothing outside
+  these paths is reachable through the provider.
+-->
+<paths>
+    <files-path name="catch_photos" path="catches/" />
+    <cache-path name="exports" path="exports/" />
+</paths>

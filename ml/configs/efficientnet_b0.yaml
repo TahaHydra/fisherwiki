@@ -1,0 +1,21 @@
+# Architecture comparison arm. Same data and schedule as global_v1 so the only
+# variable is the backbone.
+corpus: global_v1
+backbone: efficientnet_b0
+image_size: 224
+batch_size: 64
+epochs: 30
+lr: 0.002
+weight_decay: 0.00002
+warmup_epochs: 2
+label_smoothing: 0.1
+genus_loss_weight: 0.2
+family_loss_weight: 0.1
+embedding_dim: 256
+amp: true
+workers: 8
+seed: 1337
+pretrained: true
+balanced_sampling: true
+freeze_backbone_epochs: 1
+early_stop_patience: 8

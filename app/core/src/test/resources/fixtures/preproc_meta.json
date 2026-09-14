@@ -1,0 +1,18 @@
+{
+  "size": 224,
+  "source_width": 500,
+  "source_height": 333,
+  "resize_ratio": 1.1428571428571428,
+  "mean": [
+    0.485,
+    0.456,
+    0.406
+  ],
+  "std": [
+    0.229,
+    0.224,
+    0.225
+  ],
+  "layout": "CHW float32 big-endian",
+  "note": "Produced by ml/fwml/data.py eval_transform + to_tensor, the exact path used for validation and test. The Kotlin Preprocessor must reproduce this from the same PNG."
+}

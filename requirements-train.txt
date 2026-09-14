@@ -1,0 +1,21 @@
+# Training and export (.venv-train). Install torch/torchvision FIRST, from the
+# index appropriate to your hardware - see docs/TRAINING.md. They are omitted
+# here deliberately: pinning a CUDA wheel would break AMD users and vice versa.
+#
+#   AMD/ROCm on Windows:
+#     pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ \
+#         --extra-index-url https://pypi.org/simple \
+#         torch torchvision amd-torch-device-gfx1101 amd-torchvision-device-gfx1101
+#   CUDA:
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#   CPU:
+#     pip install torch torchvision
+onnx==1.22.0
+onnxruntime==1.30.0
+numpy==2.5.3
+pillow==12.3.0
+pyyaml==6.0.2
+pandas==3.0.5
+pyarrow==25.0.1
+duckdb==1.5.5
+tqdm==4.67.1

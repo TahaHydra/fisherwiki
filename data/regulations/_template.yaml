@@ -1,0 +1,48 @@
+# Template for a jurisdiction rule pack. Copy, rename to the jurisdiction code
+# in lower case (e.g. gb-eng.yaml, us-fl.yaml, fr.yaml), and fill in.
+#
+# Read data/regulations/README.md first. In particular: do not add a rule you
+# cannot cite, and do not add a jurisdiction you are not willing to maintain.
+
+jurisdiction: GB-ENG          # ISO 3166-2 where one exists
+version: 1                    # bump on every content change
+retrieved_on: "2026-01-01"    # the date YOU checked the source
+
+sources:
+  - source_id: ea-coarse-2026
+    title: Freshwater fishing byelaws
+    authority: Environment Agency
+    url: https://www.gov.uk/government/publications/...
+    retrieved_on: "2026-01-01"
+    licence: OGL-3.0          # must permit redistribution
+    notes: >-
+      Anything a reader needs in order to judge how much to trust this, e.g.
+      which waters it covers and which it explicitly does not.
+
+rules:
+  # A species-specific size limit.
+  - jurisdiction: GB-ENG
+    kind: minimum_size        # see VALID_RULE_KINDS in regulations.py
+    taxon: Esox lucius
+    taxon_rank: species
+    value_num: 0
+    unit: cm
+    waters: freshwater
+    text: >-
+      Exact wording, or a faithful paraphrase. Do not summarise away a
+      condition.
+    valid_from: "2026-01-01"
+    valid_until: "2026-12-31"   # omit only if the source states no end date
+    source_id: ea-coarse-2026
+
+  # A rule with no taxon applies to everything in the jurisdiction.
+  - jurisdiction: GB-ENG
+    kind: licence_required
+    taxon: null
+    taxon_rank: species
+    unit: none
+    text: >-
+      A rod licence is required for anyone aged 13 or over fishing for
+      freshwater fish, salmon, trout, smelt or eel.
+    valid_from: "2026-01-01"
+    source_id: ea-coarse-2026
