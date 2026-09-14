@@ -306,6 +306,12 @@ def train(
         family_of_class = family_of_class.to(device)
 
     for epoch in range(start_epoch, cfg.epochs):
+        # Must happen before the epoch's first batch: see
+        # FishDataset.set_epoch for why every epoch got identical
+        # augmentation without this.
+        if hasattr(train_loader.dataset, "set_epoch"):
+            train_loader.dataset.set_epoch(epoch)
+
         # Head-only warmup: let the randomly-initialised heads settle before
         # letting gradients disturb pretrained features.
         if cfg.freeze_backbone_epochs:

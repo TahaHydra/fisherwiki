@@ -142,27 +142,52 @@ def logits_for_array(model, arr: np.ndarray, device, amp: bool, bs: int = 128):
     return np.concatenate(chunks) if chunks else np.zeros((0, 1), np.float32)
 
 
-def load_negative_rows(kind: str, limit: int, size: int) -> list[dict]:
+def load_negative_rows(kind: str, limit: int, size: int, corpus: str = "global_v1") -> list[dict]:
     """Rows for a negative set, drawn from the provenance store."""
     import duckdb
 
     con = duckdb.connect(str(PATHS.provenance_db), read_only=True)
     try:
         if kind == "held_out_fish":
-            # Fish we stored but which did not make the class list. These are
-            # genuine fish photographs of species the model has never seen.
+            # Fish we stored but whose *species* did not make the class list.
+            # These are genuine fish photographs of species the model has
+            # never seen.
+            #
+            # The obvious-looking query checks candidate_id membership in
+            # corpus_members instead of taxon_id, which is wrong: it asks
+            # "was this exact photo excluded", not "was this species
+            # excluded". Measured impact on this corpus - 1,250 of 4,414
+            # candidate rows (28.3%), spanning 629 distinct species, belong
+            # to species that *are* trained classes. 1,243 of those 1,250
+            # (99.4%) are exact sha256 duplicates of a photo that won the
+            # cross-candidate dedup tie-break in splits.py's `eligible` CTE
+            # and so is genuinely in corpus_members under a different
+            # candidate_id - re-uploads, cross-posts, the same observation
+            # submitted twice. A model that has trained on the winning
+            # duplicate should recognise the losing one confidently and
+            # correctly, which is the opposite of what this set is meant to
+            # measure: those rows drag the reported rejection rate toward
+            # "the model correctly answers a species it knows", not away
+            # from open-set failure.
+            #
+            # The species-level check below is correct regardless of which
+            # candidate happened to win that tie-break, and is scoped to the
+            # corpus actually being evaluated rather than any corpus that
+            # happens to share a provenance store.
             rows = con.execute(
-                f"""
+                """
                 SELECT p.sha256, p.cas_path, p.accepted_scientific_name AS name
                 FROM provenance p
                 WHERE p.species_taxon_id IS NOT NULL
                   AND NOT EXISTS (
                       SELECT 1 FROM corpus_members m
-                      WHERE m.candidate_id = p.candidate_id
+                      WHERE m.corpus = ?
+                        AND m.taxon_id = p.species_taxon_id
                   )
                 ORDER BY hash(p.sha256)
-                LIMIT {int(limit)}
-                """
+                LIMIT ?
+                """,
+                [corpus, int(limit)],
             ).fetchall()
         elif kind == "non_fish":
             rows = con.execute(
@@ -294,7 +319,7 @@ def main(argv=None) -> int:
     # --- negatives ----------------------------------------------------------
     for kind in ("held_out_fish", "non_fish"):
         try:
-            neg_rows = load_negative_rows(kind, args.limit, size)
+            neg_rows = load_negative_rows(kind, args.limit, size, corpus=corpus)
         except SystemExit:
             raise
         except Exception as exc:

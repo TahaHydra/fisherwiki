@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import io
 import math
+import multiprocessing as mp
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -200,7 +201,15 @@ def random_erase(t: torch.Tensor, cfg: AugmentConfig, rng: random.Random) -> tor
     ew = max(1, int(w * math.sqrt(frac)))
     y0 = rng.randint(0, max(0, h - eh))
     x0 = rng.randint(0, max(0, w - ew))
-    t[:, y0:y0 + eh, x0:x0 + ew] = torch.randn(3, eh, ew) * 0.25
+    # A seeded Generator, not torch.randn's default global RNG. The region
+    # (y0, x0, eh, ew) above is already deterministic in (seed, epoch, idx)
+    # via `rng`; the *fill* was not, because torch's global RNG state
+    # advances with every call regardless of which item is being processed,
+    # so two calls for the same item could still produce different noise.
+    # Drawing the seed from `rng` keeps the whole augmentation - region and
+    # fill both - inside the same reproducible chain.
+    fill_gen = torch.Generator().manual_seed(rng.randrange(2**31))
+    t[:, y0:y0 + eh, x0:x0 + ew] = torch.randn(3, eh, ew, generator=fill_gen) * 0.25
     return t
 
 
@@ -237,6 +246,33 @@ class FishDataset(Dataset):
         # in the manifest, and any per-row breakdown computed by zipping the
         # two would silently misalign after the first unreadable file.
         self.emit_index = emit_index
+        # Shared across worker processes -- this is load-bearing, not a style
+        # choice. `train.py` runs with `persistent_workers=True`, so worker
+        # processes are spawned once and reused for every epoch; a plain
+        # Python attribute set on the main-process dataset object after that
+        # point would never reach them; DataLoader only re-pickles the dataset
+        # at worker *startup*. `multiprocessing.Value` is backed by real
+        # shared memory, so a mutation in the main process (see `set_epoch`)
+        # is visible to already-running workers, including under Windows'
+        # `spawn` start method. See `set_epoch` for why this exists at all.
+        self._epoch = mp.Value("i", 0)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Call before each epoch, or every item gets identical augmentation
+        on every epoch.
+
+        Before this existed, `__getitem__`'s RNG was seeded from `(seed, idx)`
+        only, despite a comment on that line claiming `(seed, epoch, idx)` --
+        the epoch was never actually in the formula, and nothing threaded an
+        epoch number into this class at all. The effect: image #18273 got the
+        exact same random crop, flip, brightness, contrast, colour shift, blur,
+        JPEG recompression and erase rectangle on epoch 1, 2, 3, ... 30. Not a
+        crash, not a metric that looks wrong -- augmentation still ran, the
+        loss curve still looked like augmentation was happening -- just a
+        quieter, harder-to-notice kind of overfitting to 30 fixed variants of
+        each photo instead of the many the config was written to produce.
+        """
+        self._epoch.value = int(epoch)
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -252,9 +288,13 @@ class FishDataset(Dataset):
 
     def __getitem__(self, idx: int):
         row = self.rows[idx]
-        # Per-item RNG so a worker's output depends only on (seed, epoch, idx),
-        # which keeps runs reproducible across different worker counts.
-        rng = random.Random((self.seed * 1_000_003 + idx) & 0x7FFFFFFF)
+        # Per-item RNG so a worker's output depends only on (seed, epoch, idx)
+        # -- actually depends on it now; see `set_epoch`. Deterministic in all
+        # three, which keeps runs reproducible across different worker counts
+        # and makes a resumed run's augmentation match a from-scratch one.
+        rng = random.Random(
+            (self.seed * 1_000_003 + self._epoch.value * 7_919_837 + idx) & 0x7FFFFFFF
+        )
         try:
             with Image.open(self._path(row)) as im:
                 # Decode at reduced scale directly in the DCT domain where the
