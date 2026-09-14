@@ -2,12 +2,35 @@
 
 Every number here was measured on this project's data. The test split was read
 exactly once, after calibration was fitted on validation, and nothing was tuned
-against it.
+against it - the model's weights, specifically, were never adjusted in
+response to a test-split number. Two honest qualifications to that claim,
+below, rather than leaving it stated more cleanly than it holds.
 
 **Run:** `global_v1_mobilenet_v3_large`
 **Code commit:** `5da099d`
 **Dataset manifest SHA-256:** `b2e8d084977c728f…`
 **Trained:** 2026-09-13 22:35 → 2026-09-14 06:42 (8h 07m, 30 epochs)
+
+> **The code commit above is not publicly resolvable.** It refers to internal
+> development history from before this repository's first public push, which
+> replaced ~40 incremental commits with a single clean initial commit. The
+> hash is a true record of what built this model - it is simply not something
+> an outside reader can `git show`. There is no way to restore it after the
+> fact without a source snapshot taken at the time, which was not done, so this
+> is stated as a known gap rather than papered over with a hash that resolves
+> to the wrong tree. A tagged, publicly-resolvable snapshot at model-build time
+> is the fix for the *next* model, not this one - see `task.md`.
+>
+> **The held-out test split has become a development holdout for the product,
+> not only a frozen number for the model.** §5 and §7 below were written by
+> inspecting test-split confusions - that is how the *Trachinus draco* /
+> *Mullus barbatus* safety gap was found - and `build_pack.py` now populates
+> `similar_species` and per-class accuracy from those same test predictions.
+> The model's weights were never retrained against test, and the top-1 numbers
+> below are genuine, but "read exactly once" no longer describes the whole
+> relationship between this codebase and its test split, and the opening
+> sentence overstated it. A four-way split (train / val / development-test /
+> frozen release-test) is the honest fix, tracked in `task.md`.
 
 ---
 
@@ -23,9 +46,24 @@ against it.
 | Shipped format | ONNX fp16, **7.5 MB** |
 | Pack size | 32.6 MB (model + species DB + geo prior + attributions) |
 
-Auxiliary genus and family heads are trained at loss weights 0.2 and 0.1. They
-exist mainly so the coarse fallback is backed by a head that was trained to make
-that claim, and to give the long tail some shared gradient signal.
+Auxiliary genus and family heads are trained at loss weights 0.2 and 0.1, mainly
+to give the long tail some shared gradient signal from related species.
+
+**They are not what the app's genus fallback actually uses, and an earlier
+version of this document implied otherwise.** `ExportWrapper` (`ml/export.py`)
+exports only the species logits and the embedding; the genus and family heads
+never leave the training checkpoint. On device, `CandidateRanker`'s coarse
+fallback sums *species* probabilities by genus membership - "if the model
+spreads mass across three *Sebastes*, claim the genus even though no single
+species clears the bar" - which is a deliberate, reasonable design (grouping a
+distribution the app already has, rather than shipping a second output tensor
+and a second calibration to maintain), but it is aggregation over the species
+head, not a claim backed by a head trained to make it. Likewise, "genus
+accuracy" and "family accuracy" below are the genus/family of the top
+*species* prediction, not the genus head's own accuracy - that number was
+never measured, because nothing on the serving path ever reads that head's
+output. Exporting and using it directly is listed in `task.md` if that
+changes.
 
 ---
 
@@ -218,10 +256,10 @@ Does it refuse things that are not in the class list?
 
 | negative set | n | rejected | mean confidence |
 |---|---|---|---|
-| **held-out fish species** (717 species never seen) | 3,000 | **86.3%** | 0.383 |
-| **non-fish** (birds, amphibians, plants, crustaceans…) | 2,978 | **97.8%** | 0.231 |
-| synthetic (noise, gradients, flats) | 1,000 | 100.0% | 0.167 |
-| *closed set, for comparison* | 3,000 | *70.2%* | — |
+| **held-out fish species** (88 species never seen) | 3,000 | **93.3%** | 0.323 |
+| **non-fish** (birds, amphibians, plants, crustaceans…) | 2,978 | **97.8%** | 0.232 |
+| synthetic (noise, gradients, flats) | 1,000 | 100.0% | 0.168 |
+| *closed set, for comparison* | 3,000 | *70.0%* | — |
 
 The non-fish set is the one worth dwelling on: it was drawn from the **same
 source, same photographers, same conditions** as the training data, and weighted
@@ -229,9 +267,30 @@ toward amphibians, reptiles and aquatic invertebrates precisely because they
 share habitat and posture with fish. 97.8% rejection there is a real result, not
 an artefact of an easy negative set.
 
-Held-out fish at 86.3% is the hardest case and the honest weak spot: an unseen
-*Sebastes* looks exactly like a seen one. The 13.7% that slip through are
-mostly, though not always, assigned to the right genus.
+Held-out fish at 93.3% is the hardest case and the honest weak spot: an unseen
+*Sebastes* looks exactly like a seen one. The 6.7% that slip through are mostly,
+though not always, assigned to the right genus.
+
+### This number was wrong until it wasn't
+
+The held-out-fish query originally checked `candidate_id NOT IN corpus_members`
+— "was this exact photo excluded" — not `taxon_id NOT IN (trained classes)` —
+"was this species excluded". Measured on this corpus: 1,250 of 4,414 candidates
+in that pool (28.3%), spanning 629 distinct species, belonged to species that
+*are* trained classes. 1,243 of those were exact SHA-256 duplicates that lost
+the cross-candidate dedup tie-break during corpus construction (a re-upload or
+cross-post of a photo that won the tie-break under a different candidate id,
+and so is genuinely in the training corpus) — the model had, in the most literal
+sense, seen the pixels.
+
+A model that recognises its own training duplicate confidently and correctly
+is not an open-set failure; scoring it as one drags the reported rejection rate
+toward "correctly answers a species it knows". Fixing the query to check
+species rather than candidate id **raised** the measured rate, from 86.3% to
+93.3%, and dropped the distinct-species count in the pool from 717 to 88 —
+the 717 figure was itself downstream of the same bug, since most of those
+"717 species" were in fact trained ones contributing contaminated rows. See
+`docs/engineering-log.md` for the full measurement.
 
 ---
 

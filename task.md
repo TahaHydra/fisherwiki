@@ -99,6 +99,23 @@ combined.
    or find a growth-stable assignment rule for small classes that does not
    reintroduce the 284-classes-with-no-validation-images problem the current
    rule exists to fix.
+9. **Export and use the genus/family heads, or retire them.** They are trained
+   (loss weights 0.2/0.1) but `ExportWrapper` never exports their logits, so
+   the on-device genus fallback aggregates the species head's own probability
+   mass by genus instead — a reasonable design, but not what an earlier
+   version of `docs/MODEL.md` implied. Either export both heads and let the
+   ranker consult them directly (measuring whether that is actually more
+   accurate than aggregation first), or drop the framing that they back the
+   fallback and keep them purely as an auxiliary training signal.
+10. **A genuinely untouched final release-test.** `docs/MODEL.md` §5 was
+    developed by inspecting confusions on the test split, and `build_pack.py`
+    now populates `similar_species`/per-class accuracy from
+    `class_metrics_test.json` — real, useful, but it means the held-out test
+    split has become a development holdout for the *product*, not only a
+    frozen number for the *model*. Consider a four-way split for V2 (train /
+    val / development-test / release-test), building calibration and safety
+    cross-references from val/dev-test, and reading release-test exactly once
+    after everything is frozen.
 
 ---
 

@@ -127,6 +127,25 @@ Design rules the pipeline enforces rather than documents:
 Steps 2–7 contain no I/O beyond reading the verified pack files, and no network
 code exists anywhere in `:core`.
 
+**Steps 5 and 6 compose without independent validation, and that is a real
+gap, not a hypothetical one.** The thresholds `CandidateRanker` applies in
+step 6 (`unknown_threshold`, `margin_threshold`, `entropy_threshold`, and the
+temperature that produced them) are fitted in `ml/evaluate.py` against
+*purely visual* calibration on the validation split - step 5 does not exist
+at fitting time. Step 5 then multiplies those calibrated probabilities by a
+geographic factor and renormalises before step 6 ever sees them, so the
+0.0071 test-split ECE reported in `docs/MODEL.md` describes the visual-only
+distribution, not the geo-adjusted one a user with location enabled actually
+receives. `GeoPrior`'s factor is deliberately bounded so it cannot zero a
+species out or manufacture false confidence from thin data (see its own
+kdoc), which limits how badly this can go wrong, but "limited" is not the
+same claim as "measured". No evaluation in this project currently compares
+visual-only against visual+geo on a held-out geographic split. It is not
+currently the most urgent gap to close - the Android location flow this would
+calibrate is itself not wired in yet, tracked separately in `task.md` - but
+closing one without the other would ship a geo-ranked confidence number this
+project has never actually checked the calibration of.
+
 ---
 
 ## 4. Key decisions and why
