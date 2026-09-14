@@ -311,6 +311,16 @@ class CatchLog(context: Context) {
          *   even when the user disagreed with it from the very first save -
          *   correction data is only useful for improving the model if it is
          *   honest about what the model actually predicted.
+         *
+         *   [identifiedTaxonId] deliberately does *not* fall back to
+         *   [Identification.coarseFallback]'s taxon id: a genus-level fallback
+         *   is identified by a synthetic negative id (`-1L - classIndex`,
+         *   see `CandidateRanker.coarseOrUnknown`) that names no row in the
+         *   species database. Storing it here would put a value that looks
+         *   like a real taxon id into a column named exactly that, for any
+         *   future reader (an export, a stats query) that does not know the
+         *   sign convention. [identifiedName] still carries the genus name as
+         *   text, which is genuinely descriptive rather than a placeholder.
          */
         fun from(
             identification: Identification,
@@ -320,8 +330,7 @@ class CatchLog(context: Context) {
             correction: Pair<Long, String>? = null,
         ): CatchRecord = CatchRecord(
             photoPaths = photoPaths,
-            identifiedTaxonId = identification.best?.taxon?.id
-                ?: identification.coarseFallback?.taxon?.id,
+            identifiedTaxonId = identification.best?.taxon?.id,
             identifiedName = identification.best?.taxon?.scientificName
                 ?: identification.coarseFallback?.taxon?.scientificName,
             correctedTaxonId = correction?.first,

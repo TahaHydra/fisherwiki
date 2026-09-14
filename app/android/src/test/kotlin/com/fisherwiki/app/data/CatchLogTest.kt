@@ -71,6 +71,31 @@ class CatchLogTest {
     }
 
     @Test
+    fun `a genus-level fallback is recorded without a fake species id`() {
+        // CandidateRanker.coarseOrUnknown mints the fallback's taxon id as
+        // `-1L - classIndex` - real, but not a row in the species database.
+        val genusFallback = Candidate(
+            taxon = Taxon(id = -2L, scientificName = "Sebastes", rank = Rank.GENUS, genus = "Sebastes"),
+            probability = 0.73f, visualProbability = 0.73f, classIndex = -1,
+        )
+        val identification = Identification(
+            certainty = Certainty.COARSE_ONLY,
+            best = null,
+            alternatives = emptyList(),
+            coarseFallback = genusFallback,
+            rejectionReason = com.fisherwiki.core.model.RejectionReason.NARROW_MARGIN,
+        )
+
+        val record = CatchLog.from(identification, photoPaths = emptyList())
+
+        // The genus name is real and worth keeping; the synthetic id is not
+        // a species and must not be stored in a column named identifiedTaxonId.
+        assertThat(record.identifiedTaxonId).isNull()
+        assertThat(record.identifiedName).isEqualTo("Sebastes")
+        assertThat(record.displayName).isEqualTo("Sebastes")
+    }
+
+    @Test
     fun `a corrected record round-trips through insert and all`() {
         val identification = Identification(
             certainty = Certainty.CONFIDENT,

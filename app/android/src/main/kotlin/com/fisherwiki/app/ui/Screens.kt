@@ -662,19 +662,18 @@ fun CatchLogScreen(onOpenSpecies: (Long) -> Unit) {
         contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
     ) {
         items(catches) { c ->
-            // A genus-level catch (CandidateRanker's coarse fallback) stores a
-            // synthetic negative id - `-1L - genusIndex`, never a real
-            // fw_taxon_id - because there is no taxon row for "some kind of
-            // Sebastes" to open. Passing it to onOpenSpecies used to navigate
-            // straight to a "Species not found" screen; a real taxon id is
-            // always positive, so that is the correct and complete guard.
-            val hasSpeciesPage = (c.identifiedTaxonId ?: -1L) > 0L
+            // A genus-level catch (CandidateRanker's coarse fallback) has no
+            // real fw_taxon_id - there is no taxon row for "some kind of
+            // Sebastes" to open - so CatchLog.from() leaves identifiedTaxonId
+            // null rather than storing the fallback's synthetic negative id.
+            // null here means exactly "no species page", never "not saved yet".
+            val hasSpeciesPage = c.identifiedTaxonId != null
             Column(
                 Modifier
                     .fillMaxWidth()
                     .clickable {
                         if (hasSpeciesPage) {
-                            c.identifiedTaxonId?.let(onOpenSpecies)
+                            onOpenSpecies(c.identifiedTaxonId)
                         } else {
                             android.widget.Toast.makeText(
                                 ctx,

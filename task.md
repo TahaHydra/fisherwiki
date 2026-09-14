@@ -134,6 +134,16 @@ combined.
     `exif_transpose`. Needs a device/AVD, or a Robolectric shadow of
     `BitmapFactory` trustworthy enough to stand in for one — neither exists
     here yet.
+13. **Two Settings fields are still dead code.** `showCoarseFallback` (meant
+    to let a user turn off genus-level answers) has no reader anywhere, not
+    even the Settings screen itself — there is no toggle for it, so it sits
+    at its hardcoded default forever. `useImperialUnits` does have a working
+    Settings toggle that persists, but nothing downstream reads it: no
+    length/weight value is currently displayed anywhere for it to convert
+    (`CatchRecord.lengthMm`/`weightG` exist in the schema but nothing writes
+    or shows them yet either). Distinct from the camera/location gap this
+    pass fixed — that was a permissions/safety issue; this is unbuilt
+    display polish.
 
 ---
 
@@ -262,7 +272,7 @@ See [`docs/MODEL.md` §6](docs/MODEL.md).
 |---|---|
 | Model | ONNX fp16, 7.5 MB, 3,993,078 params (+0.0007 top-1 vs fp32, 99.9% agreement) |
 | Pack | `global_v1-v1.fwpack`, 32.6 MB, all 16 `verify_pack.py` checks pass |
-| Tests | 211 Python (`.venv`) + 11 torch (`.venv-train`) + 198 Kotlin (136 core + 51 cli + 11 android) |
+| Tests | 211 Python (`.venv`) + 11 torch (`.venv-train`) + 199 Kotlin (136 core + 51 cli + 12 android) |
 
 ### Hardware and pipeline
 
