@@ -191,7 +191,13 @@ def collect_logits(model, loader, device, amp: bool):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--run", required=True)
-    ap.add_argument("--split", default="val", choices=["val", "test", "geo_test"])
+    # V1 names (val/test/geo_test) and V2 names (validation/dev_test) both work,
+    # because one checkout has to be able to evaluate either generation's
+    # manifest. `final_test` is accepted by the parser only so that asking for
+    # it produces the explanation below rather than an argparse usage dump.
+    ap.add_argument("--split", default="val",
+                    choices=["val", "test", "geo_test",
+                             "validation", "dev_test", "final_test"])
     ap.add_argument("--fit-calibration", action="store_true")
     ap.add_argument("--which", default="best")
     ap.add_argument("--batch-size", type=int, default=128)
@@ -204,6 +210,26 @@ def main(argv=None) -> int:
         raise SystemExit(
             "Refusing to fit calibration on the test split. Fit on val, then "
             "report test once."
+        )
+
+    if args.split == "final_test":
+        raise SystemExit(
+            "final_test is sealed and is not in manifest.parquet, so this tool "
+            "cannot read it.\n"
+            "It is the V2 release holdout: every read spends some of its value "
+            "as an unbiased estimate.\n"
+            "Use --split dev_test for confusion analysis, threshold work, "
+            "similar-species tables and safety cross-references.\n"
+            "For a genuine release evaluation:\n"
+            "    python tools/dataset.py v2-release-eval --corpus global_v2 "
+            '--reason "<why>" --i-am-releasing'
+        )
+
+    if args.split == "dev_test" and args.fit_calibration:
+        raise SystemExit(
+            "Refusing to fit calibration on dev_test. Fit on validation; "
+            "dev_test is for product development measurement, and fitting on "
+            "it makes the two indistinguishable."
         )
 
     run_dir = Path(args.run)

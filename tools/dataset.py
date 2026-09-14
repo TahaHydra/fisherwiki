@@ -229,6 +229,119 @@ def cmd_attributions(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# V2 splits
+# ---------------------------------------------------------------------------
+def cmd_v2_assign(args: argparse.Namespace) -> int:
+    from fwdata.splits_v2 import V2SplitStore
+
+    with V2SplitStore() as store:
+        stats = store.assign(
+            batch=args.batch,
+            near_duplicates=not args.no_near_duplicates,
+            coverage_topup=not args.no_coverage_topup,
+            limit=args.limit,
+            log=_log,
+        )
+        checks = store.verify()
+        _log("")
+        _log(f"  verification: {checks}")
+        _log(f"  fingerprint : {store.fingerprint()[:16]}")
+    if any(checks.values()):
+        _log("")
+        _log("REFUSING: the split state failed its structural checks.")
+        return 1
+    out = PATHS.work / f"v2_assign_{args.batch}.json"
+    out.write_text(json.dumps(stats.as_dict(), indent=2), encoding="utf-8")
+    _log(f"wrote {out}")
+    return 0
+
+
+def cmd_v2_verify(args: argparse.Namespace) -> int:
+    from fwdata.splits_v2 import V2SplitStore
+
+    with V2SplitStore(read_only=True) as store:
+        checks = store.verify()
+        _log(json.dumps(checks, indent=2))
+        _log(f"fingerprint: {store.fingerprint()}")
+    return 1 if any(checks.values()) else 0
+
+
+def cmd_v2_export(args: argparse.Namespace) -> int:
+    from fwdata.splits_v2 import V2SplitStore
+
+    with V2SplitStore() as store:
+        checks = store.verify()
+        if any(checks.values()):
+            _log(f"REFUSING to export: {checks}")
+            return 1
+        result = store.export_manifests(
+            args.corpus,
+            min_images_per_class=args.min_images,
+            min_observations_per_class=args.min_observations,
+            log=_log,
+        )
+    _log(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_v2_release_eval(args: argparse.Namespace) -> int:
+    """The only door to final_test, and it keeps a record of everyone through it."""
+    from fwdata.splits_v2 import V2SplitStore, release_eval_authorised
+
+    with V2SplitStore() as store:
+        try:
+            path = store.open_final_test(
+                args.corpus,
+                reason=args.reason or "",
+                authorised=release_eval_authorised(args.i_am_releasing),
+            )
+        except (PermissionError, ValueError, FileNotFoundError) as exc:
+            _log(str(exc))
+            return 1
+        _log(f"final_test unsealed: {path}")
+        _log("")
+        _log("accesses recorded for this dataset version:")
+        for when, reason, commit, rows in store.access_log():
+            _log(f"  {when}  {commit[:12]}  {rows:>7,} rows  {reason}")
+    return 0
+
+
+def cmd_v2_status(args: argparse.Namespace) -> int:
+    from fwdata.splits_v2 import DATASET_VERSION, V2SplitStore
+
+    with V2SplitStore(read_only=True) as store:
+        rows = store.con.execute(
+            "SELECT split, count(*) FROM split_groups WHERE dataset_version = ? "
+            "GROUP BY split ORDER BY split", [DATASET_VERSION],
+        ).fetchall()
+        images = store.con.execute(
+            "SELECT g.split, count(*) FROM split_group_members m "
+            "JOIN split_groups g USING (dataset_version, group_id) "
+            "WHERE m.dataset_version = ? GROUP BY g.split ORDER BY g.split",
+            [DATASET_VERSION],
+        ).fetchall()
+        rules = store.con.execute(
+            "SELECT rule, count(*) FROM split_groups WHERE dataset_version = ? "
+            "GROUP BY rule ORDER BY 2 DESC", [DATASET_VERSION],
+        ).fetchall()
+        quarantined = store.con.execute(
+            "SELECT count(*) FROM split_quarantine WHERE dataset_version = ?",
+            [DATASET_VERSION],
+        ).fetchone()[0]
+        _log(f"dataset_version {DATASET_VERSION}")
+        _log(f"  groups by split: {dict(rows)}")
+        _log(f"  images by split: {dict(images)}")
+        _log(f"  assignment rule: {dict(rules)}")
+        _log(f"  quarantined    : {quarantined:,}")
+        _log(f"  fingerprint    : {store.fingerprint()}")
+        log = store.access_log()
+        _log(f"  final_test reads: {len(log)}")
+        for when, reason, commit, n in log:
+            _log(f"    {when}  {commit[:12]}  {n:,} rows  {reason}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="dataset.py",
@@ -294,6 +407,47 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--corpus", default=None)
     p.add_argument("--out", default=None)
     p.set_defaults(func=cmd_attributions)
+
+    # --- V2 splits ---------------------------------------------------------
+    p = sub.add_parser(
+        "v2-assign",
+        help="assign V2 splits to every unassigned image (safe to re-run)",
+    )
+    p.add_argument("--batch", required=True,
+                   help="name of the acquisition batch, recorded on each new row")
+    p.add_argument("--no-near-duplicates", action="store_true",
+                   help="skip perceptual near-duplicate grouping (faster, weaker)")
+    p.add_argument("--no-coverage-topup", action="store_true")
+    p.add_argument("--limit", type=int, default=None)
+    p.set_defaults(func=cmd_v2_assign)
+
+    p = sub.add_parser("v2-verify", help="structural checks on V2 split state")
+    p.set_defaults(func=cmd_v2_verify)
+
+    p = sub.add_parser("v2-status", help="V2 split state and final_test access log")
+    p.set_defaults(func=cmd_v2_status)
+
+    p = sub.add_parser(
+        "v2-export",
+        help="write manifest.parquet (train/validation/dev_test) + sealed final_test",
+    )
+    p.add_argument("--corpus", default="global_v2")
+    p.add_argument("--min-images", type=int, default=40,
+                   help="minimum *train* images per class (not total, unlike V1: "
+                        "40 here admits 1,654 classes, 25 admits 1,963 - see "
+                        "docs/DATA_PROVENANCE.md §10)")
+    p.add_argument("--min-observations", type=int, default=25)
+    p.set_defaults(func=cmd_v2_export)
+
+    p = sub.add_parser(
+        "v2-release-eval",
+        help="unseal final_test for a release evaluation (recorded, not free)",
+    )
+    p.add_argument("--corpus", default="global_v2")
+    p.add_argument("--reason", required=True)
+    p.add_argument("--i-am-releasing", action="store_true",
+                   help="required; or set FISHERWIKI_RELEASE_EVAL=1")
+    p.set_defaults(func=cmd_v2_release_eval)
 
     return ap
 

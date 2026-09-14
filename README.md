@@ -77,7 +77,7 @@ different claims.
 | Component | Status | How verified |
 |---|---|---|
 | Data acquisition + provenance | **done** | 307,415 images fetched, every one with a licence record |
-| Licence policy enforcement | **done** | 211 Python tests; store refuses inadmissible media |
+| Licence policy enforcement | **done** | 235 Python tests; store refuses inadmissible media |
 | Taxonomy reconciliation | **done** | 43,559 canonical IDs, 66,754 synonyms, verified against GBIF |
 | Corpus + leakage-safe splits | **done** | 0 group leaks, 0 hash leaks, enforced by a refusal |
 | Species database | **done** | Kotlin tests against the real shipping schema |
@@ -167,7 +167,7 @@ then **Packs → Install from file**.
 ```bash
 py -m venv .venv
 .venv/Scripts/python -m pip install -r requirements.txt
-.venv/Scripts/python -m pytest tests/ -q          # 211 tests
+.venv/Scripts/python -m pytest tests/ -q          # 235 tests
 
 .venv/Scripts/python tools/dataset.py discover    # what is available, and its licence
 ```

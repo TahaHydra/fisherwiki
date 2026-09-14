@@ -52,6 +52,63 @@ def _bands(h: int) -> list[tuple[int, int]]:
     return [((h >> (i * BAND_BITS)) & 0xFFFF, i) for i in range(BANDS)]
 
 
+def near_duplicate_pairs(
+    items: list[tuple[str, str]],
+    *,
+    threshold: int = DEFAULT_THRESHOLD,
+    max_bucket: int = 5000,
+) -> list[tuple[str, str, int]]:
+    """``[(key_a, key_b, distance), ...]`` for hashes within ``threshold``.
+
+    ``items`` is ``[(key, dhash_hex), ...]``; keys are returned as given, so the
+    caller decides whether a key is a candidate id, a sha256 or anything else.
+    Split out of :func:`find_duplicates` so the V2 splitter can build leak
+    groups from the same banded index rather than reimplementing it - two
+    implementations of "are these the same photograph" would eventually
+    disagree, and the split is the place where that disagreement would be
+    silent and expensive.
+    """
+    buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
+    keys: list[str] = []
+    hashes: list[int] = []
+    for i, (key, dhash) in enumerate(items):
+        h = int(dhash, 16)
+        keys.append(key)
+        hashes.append(h)
+        for band in _bands(h):
+            buckets[band].append(i)
+
+    out: list[tuple[str, str, int]] = []
+    for (_value, band_idx), members in buckets.items():
+        if len(members) < 2 or len(members) > max_bucket:
+            # A bucket with thousands of members is a degenerate hash (a solid
+            # background, usually); comparing it all-pairs costs more than the
+            # information is worth.
+            continue
+        for a_i in range(len(members)):
+            a = members[a_i]
+            ha = hashes[a]
+            for b_i in range(a_i + 1, len(members)):
+                b = members[b_i]
+                hb = hashes[b]
+                # A pair that agrees on several bands turns up in each of them.
+                # Emit it only from the lowest such band instead of keeping a
+                # global set of every pair already seen: on the current store
+                # that set reaches ~17M tuples and costs gigabytes, which is
+                # what made the first full run unusable rather than merely slow.
+                if any(
+                    ((ha >> (j * BAND_BITS)) & 0xFFFF)
+                    == ((hb >> (j * BAND_BITS)) & 0xFFFF)
+                    for j in range(band_idx)
+                ):
+                    continue
+                d = _hamming(ha, hb)
+                if d <= threshold:
+                    out.append((keys[a], keys[b], d) if a < b
+                               else (keys[b], keys[a], d))
+    return out
+
+
 def find_duplicates(
     *,
     threshold: int = DEFAULT_THRESHOLD,
@@ -99,32 +156,10 @@ def find_duplicates(
     log(f"exact duplicate groups (same bytes, >1 candidate id): {len(exact):,}")
 
     # --- near duplicates via banded hashes ----------------------------------
-    buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
-    hashes: list[int] = []
-    for i, (_cid, _sha, dhash, _phash, *_rest) in enumerate(rows):
-        h = int(dhash, 16)
-        hashes.append(h)
-        for band in _bands(h):
-            buckets[band].append(i)
-
-    seen_pairs: set[tuple[int, int]] = set()
-    near_pairs: list[tuple[int, int, int]] = []
-    for members in buckets.values():
-        if len(members) < 2 or len(members) > 5000:
-            # A bucket with thousands of members is a degenerate hash (a solid
-            # background, usually); comparing it all-pairs costs more than the
-            # information is worth.
-            continue
-        for a_i in range(len(members)):
-            for b_i in range(a_i + 1, len(members)):
-                a, b = members[a_i], members[b_i]
-                key = (a, b) if a < b else (b, a)
-                if key in seen_pairs:
-                    continue
-                seen_pairs.add(key)
-                d = _hamming(hashes[a], hashes[b])
-                if d <= threshold:
-                    near_pairs.append((key[0], key[1], d))
+    by_cid = {r[0]: r for r in rows}
+    near_pairs = near_duplicate_pairs(
+        [(r[0], r[2]) for r in rows], threshold=threshold
+    )
 
     log(f"near-duplicate pairs (dhash distance <= {threshold}): {len(near_pairs):,}")
 
@@ -135,8 +170,8 @@ def find_duplicates(
     same_group = 0
     cross_observer = 0
     for a, b, d in near_pairs:
-        _, _, _, _, name_a, split_a, group_a, obs_a = rows[a]
-        _, _, _, _, name_b, split_b, group_b, obs_b = rows[b]
+        _, _, _, _, name_a, split_a, group_a, obs_a = by_cid[a]
+        _, _, _, _, name_b, split_b, group_b, obs_b = by_cid[b]
         if name_a == name_b:
             same_class += 1
         else:
@@ -147,7 +182,7 @@ def find_duplicates(
             cross_observer += 1
         if split_a and split_b and split_a != split_b:
             cross_split.append({
-                "a": rows[a][0], "b": rows[b][0],
+                "a": a, "b": b,
                 "split_a": split_a, "split_b": split_b,
                 "name_a": name_a, "name_b": name_b,
                 "distance": d,

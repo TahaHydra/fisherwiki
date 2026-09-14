@@ -9,11 +9,21 @@ Last updated: 2026-09-14
 
 ## Current phase
 
-**Phase 4 - first full training run.**
+**Phase 5 - V2 dataset.**
 
-Data pipeline, identification engine, pack format and Android app are built and
-tested. The image cache is being prepared on SSD; training restarts once it
-completes.
+V1 shipped: trained model, verified 32.6 MB pack, Android app, desktop CLI. Its
+assets are frozen and reproducible (`artifacts/global_v1`,
+`artifacts/runs/global_v1_mobilenet_v3_large`, `corpus_members`), and nothing in
+V2 writes to them.
+
+V2 begins with the split system rather than with acquisition, because the split
+is the one decision that cannot be revised later without invalidating every
+number measured against it. Four immutable splits (train / validation /
+dev_test / final_test), stored in the provenance DB rather than re-derived,
+with `final_test` sealed out of the ordinary manifest entirely. See
+[`docs/DATA_PROVENANCE.md` §10](docs/DATA_PROVENANCE.md). The V1 CAS
+(310,393 images) is acquisition batch zero; new sources follow as further
+batches, each folded in with one `v2-assign` that cannot move what exists.
 
 ---
 
@@ -272,7 +282,7 @@ See [`docs/MODEL.md` §6](docs/MODEL.md).
 |---|---|
 | Model | ONNX fp16, 7.5 MB, 3,993,078 params (+0.0007 top-1 vs fp32, 99.9% agreement) |
 | Pack | `global_v1-v1.fwpack`, 32.6 MB, all 16 `verify_pack.py` checks pass |
-| Tests | 211 Python (`.venv`) + 11 torch (`.venv-train`) + 199 Kotlin (136 core + 51 cli + 12 android) |
+| Tests | 235 Python (`.venv`) + 11 torch (`.venv-train`) + 199 Kotlin (136 core + 51 cli + 12 android) |
 
 ### Hardware and pipeline
 
