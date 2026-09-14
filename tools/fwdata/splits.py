@@ -180,7 +180,32 @@ class CorpusBuilder:
 
         log(f"building corpus {corpus!r} (strategy={strategy})")
 
-        # 1. Eligible images: stored, licensed, with a canonical taxon.
+        # 1a. Identical bytes carrying two different species labels is a
+        # label-quality problem, not a duplication problem: unlike a re-upload
+        # of the same observation, there is no principled way to prefer one
+        # candidate_id over the other, because the *label itself* is in
+        # dispute, not just which record names it. Computed before `eligible`
+        # so it can be excluded there rather than arbitrarily resolved by
+        # whichever row the dedup happens to keep - `ORDER BY candidate_id` in
+        # that QUALIFY has no relationship to which label is correct.
+        self.con.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE conflicting_hashes AS
+            SELECT sha256 FROM provenance
+            WHERE species_taxon_id IS NOT NULL AND sha256 IS NOT NULL
+            GROUP BY sha256 HAVING count(DISTINCT species_taxon_id) > 1
+            """
+        )
+        conflicts = self.con.execute(
+            "SELECT count(*) FROM conflicting_hashes"
+        ).fetchone()[0]
+        stats.label_conflicts = int(conflicts)
+        if conflicts:
+            log(f"  {conflicts:,} images carry conflicting species labels "
+                f"(identical bytes, different taxon) - excluded until reconciled")
+
+        # 1b. Eligible images: stored, licensed, with a canonical taxon, and
+        # not a disputed label.
         #
         # Deduplicated by sha256, one row per distinct image. The same
         # photograph does reach us under two candidate ids - re-uploaded as a
@@ -189,6 +214,10 @@ class CorpusBuilder:
         # therefore different splits. That is byte-identical pixels in train
         # and test: 338 cases on this corpus, caught by verify_no_leakage().
         # Content-addressed storage makes the fix exact rather than fuzzy.
+        # This dedup is sound *because* conflicting_hashes was removed first:
+        # every sha256 reaching it now has exactly one label, so any
+        # candidate_id kept by the tie-break names the same species as every
+        # other candidate_id sharing that hash.
         self.con.execute(
             f"""
             CREATE OR REPLACE TEMP TABLE eligible AS
@@ -200,28 +229,14 @@ class CorpusBuilder:
             FROM provenance p
             WHERE p.species_taxon_id IS NOT NULL
               AND p.sha256 IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM conflicting_hashes ch WHERE ch.sha256 = p.sha256
+              )
             QUALIFY row_number() OVER (
                 PARTITION BY p.sha256 ORDER BY p.candidate_id
             ) = 1
             """
         )
-
-        # Identical bytes carrying two different species labels is a
-        # label-quality problem, not a duplication problem, so it is counted
-        # and reported rather than silently resolved by the dedup above.
-        conflicts = self.con.execute(
-            """
-            SELECT count(*) FROM (
-                SELECT sha256 FROM provenance
-                WHERE species_taxon_id IS NOT NULL AND sha256 IS NOT NULL
-                GROUP BY sha256 HAVING count(DISTINCT species_taxon_id) > 1
-            )
-            """
-        ).fetchone()[0]
-        stats.label_conflicts = int(conflicts)
-        if conflicts:
-            log(f"  {conflicts:,} images carry conflicting species labels "
-                f"(identical bytes, different taxon) - kept one, flagged")
 
         # 2. Classes that clear the evidence bar *after* download losses.
         self.con.execute(

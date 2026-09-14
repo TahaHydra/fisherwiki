@@ -172,13 +172,20 @@ class TestBuilderProducesCleanSplits:
         finally:
             b.close()
 
-    def test_conflicting_labels_are_counted_not_silently_dropped(
-        self, tmp_path, monkeypatch
-    ):
+    def test_conflicting_labels_are_reported_and_excluded(self, tmp_path, monkeypatch):
+        """A hash with two different species labels is a label-quality
+        problem, not a duplication problem: there is no principled way to
+        pick one candidate_id over the other (unlike a genuine re-upload,
+        where the label agrees and only the observation differs), so both
+        must be kept out of every split until the conflict is reconciled --
+        not resolved arbitrarily by whichever row a tie-break happens to
+        keep. This is the reconciliation `docs/DATASETS.md` describes as
+        "flagged"; flagging without exclusion would train on a coin flip."""
         rows = _rows()
         conflict = dict(rows[0])
         conflict["candidate_id"] = "src:conflict"
-        conflict["taxon_id"] = 9999            # same bytes, different species
+        conflict["sha256"] = rows[0]["sha256"]  # same bytes as rows[0] ...
+        conflict["taxon_id"] = 9999             # ... but a different species
         conflict["name"] = "Other species"
         conflict["group_key"] = "obs-9-9"
         rows.append(conflict)
@@ -189,6 +196,15 @@ class TestBuilderProducesCleanSplits:
             stats = b.build("t", min_images_per_class=5,
                             min_observations_per_class=3, log=lambda m: None)
             assert stats.label_conflicts >= 1
+
+            conflicted_sha = rows[0]["sha256"]
+            in_corpus = b.con.execute(
+                "SELECT count(*) FROM corpus_members WHERE corpus = 't' AND sha256 = ?",
+                [conflicted_sha],
+            ).fetchone()[0]
+            assert in_corpus == 0, (
+                "a disputed-label image was assigned to a split rather than excluded"
+            )
         finally:
             b.close()
 
