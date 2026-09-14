@@ -293,8 +293,9 @@ class TestLeakGrouping:
     ):
         """Unioning across classes would merge two classes into one leak group
         and break the per-class stratification that makes every class
-        measurable. A cross-class near-duplicate is a labelling suspect, and is
-        reported as one."""
+        measurable. The near-duplicate search runs per taxon, so this is
+        impossible by construction rather than detected and skipped; this test
+        pins that the construction is what actually ships."""
         rows = _corpus(n_classes=12)
         a = _row(1000, "obs-x-a", "user-a", dhash="a0a0a0a0a0a0a0a0")
         b = _row(1007, "obs-x-b", "user-b", dhash="a0a0a0a0a0a0a0a1")
@@ -302,12 +303,11 @@ class TestLeakGrouping:
 
         db = _make_store(tmp_path, monkeypatch, rows)
         with V2SplitStore(db) as s:
-            stats = s.assign(batch="batch0", log=lambda m: None)
+            s.assign(batch="batch0", log=lambda m: None)
             groups = dict(s.con.execute(
                 "SELECT sha256, group_id FROM split_group_members "
                 "WHERE dataset_version = ?", [DATASET_VERSION]
             ).fetchall())
-        assert stats.cross_class_near_dupes >= 1
         assert groups[a["sha256"]] != groups[b["sha256"]]
 
     def test_all_images_of_one_observation_share_one_split(
@@ -384,7 +384,10 @@ class TestBridgingConflictQuarantines:
         """A later image can be a near-duplicate of two already-assigned groups
         that sit in different splits. Accepting it leaks; moving either group
         breaks immutability. So the new image is refused and recorded."""
-        rows = _corpus(n_classes=12)
+        # One photographer per observation: with observer inheritance now
+        # unconditional, a fixture that reuses photographers across groups ties
+        # a whole class into a single split and this scenario stops existing.
+        rows = _corpus(n_classes=12, groups_per_class=24, observers_per_class=24)
         db = _make_store(tmp_path, monkeypatch, rows)
         before = _assign(db, "batch0")
 
@@ -401,8 +404,10 @@ class TestBridgingConflictQuarantines:
         by_split: dict[str, str] = {}
         for split, sha in pairs:
             by_split.setdefault(split, sha)
-        if len(by_split) < 2:
-            pytest.skip("fixture did not produce two splits for this class")
+        assert len(by_split) >= 2, (
+            "fixture no longer produces two splits within one class, so the "
+            "bridging-conflict path is not being exercised at all"
+        )
 
         (split_a, sha_a), (split_b, sha_b) = list(by_split.items())[:2]
 

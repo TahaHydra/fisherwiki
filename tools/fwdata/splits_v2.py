@@ -55,20 +55,28 @@ component over these edges, strongest first.
    deduplicated afterwards. 1,102 hashes in the current store arrive under more
    than one candidate id; under V1 a tie-break decided which record survived,
    and the losers polluted the open-set "unseen species" pool.
-2. **Near duplicates.** ``dhash`` Hamming distance <= 6, found with the banded
-   index in :mod:`fwdata.dedupe` (exact, not approximate, at this threshold).
-   A re-upload at a different size, or the same fish two frames apart, is the
-   same evidence and must not straddle a split. **Restricted to pairs with the
-   same taxon**, and that restriction is load-bearing rather than cautious:
-   measured on the V1 CAS, 210,381 pairs clear the threshold but only 2,509 of
-   them are same-class. The other 204,430 come from just 11,441 images (3.7% of
-   the corpus) whose dhash carries almost no signal - dark, uniform or
-   low-contrast frames, including 29 images hashing to all zeroes - so they
-   collide with everything and with each other. Unioning those would have
-   collapsed unrelated species into one leak group and destroyed per-class
-   stratification. They are counted and reported as a *hash-quality* signal,
-   which is what they are; they are not evidence of mislabelling, and 204,430
-   label disputes would not be a credible reading of them.
+2. **Near duplicates.** ``dhash`` Hamming distance <= 6, computed **per taxon**
+   with the exact search in :mod:`fwdata.dedupe`. A re-upload at a different
+   size, or the same fish two frames apart, is the same evidence and must not
+   straddle a split.
+
+   Searching per taxon rather than globally is not an optimisation detail: only
+   same-taxon pairs are ever unioned, so cross-class unions become impossible
+   by construction rather than computed and then discarded. It also keeps each
+   input small enough for blocked brute force, which cannot miss a pair. The
+   earlier global banded index could: it required one 16-bit band to match
+   exactly, which only finds every pair when the threshold is below the band
+   count, and the threshold is 6 against 4 bands. Measured on the V1 CAS it
+   missed 451 of the 2,960 genuine same-taxon pairs - 15%, each one a chance
+   for the same photograph to sit in train and in the sealed holdout.
+
+   The same-taxon restriction is load-bearing for a second reason. Globally,
+   210,381 pairs clear the threshold and only ~3,000 are same-class; the rest
+   come from a few thousand images whose dhash carries almost no signal - dark,
+   uniform or low-contrast frames, 29 of them hashing to all zeroes - which
+   collide with everything. Unioning those would have collapsed unrelated
+   species into single leak groups. ``dataset.py dedupe`` still reports them,
+   as the hash-quality signal they are rather than as label disputes.
 3. **Observation / media group.** All images of one ``group_key`` - one sighting
    of one individual fish - go together. This is V1's unit and it is sound: an
    observation has exactly one taxon, which is what makes per-class
@@ -77,11 +85,24 @@ component over these edges, strongest first.
    is the OBSERVER strategy, which was measured on this corpus and rejected:
    ~5,500 photographers spanning 1,978 classes left 284 classes with no
    validation images at all. Instead observer disjointness is applied as a
-   *soft* rule at assignment time - a new group inherits the split its
-   photographer already holds within that class, but only where the class has
-   at least ``min_observers_for_disjoint`` distinct photographers, so the rule
-   can never starve a thin class. Which rule decided each row is recorded in
-   ``split_groups.rule``, so the mix is auditable rather than assumed.
+   *soft, unconditional* rule at assignment time: a new group inherits the
+   split any of its photographers already holds within that class.
+
+   It used to be gated on the class having at least 8 distinct photographers,
+   which was wrong in a way only growth reveals. A class assigned while it had
+   5 photographers got no inheritance, so one photographer's groups landed in
+   train and in the holdout; when the class later reached 8 the rule switched
+   on, but immutability means those assignments can never be repaired, so that
+   photographer straddles the boundary forever. The gate also made the outcome
+   depend on the *current* photographer count - the same "depends on how much
+   data exists right now" coupling that V2 exists to remove. Unconditional
+   inheritance is state-independent and monotone: a photographer's first group
+   in a class fixes the split for all of that photographer's later groups
+   there. Thin classes are protected by ``MIN_GROUPS_FOR_HOLDOUT`` and the
+   coverage top-up instead, which is where that protection belongs.
+
+   Which rule decided each row is recorded in ``split_groups.rule``, so the mix
+   is auditable rather than assumed.
 
 What happens when growth merges two assigned groups
 ---------------------------------------------------
@@ -146,10 +167,10 @@ DEFAULT_FRACTIONS: dict[str, float] = {
 #: data. V1 used the same rule for the same reason.
 MIN_GROUPS_FOR_HOLDOUT = 4
 
-#: Observer-disjointness is only applied to classes with at least this many
-#: distinct photographers. Below it, tying a photographer's groups together can
-#: empty a split for that class - the 284-classes failure, in miniature.
-MIN_OBSERVERS_FOR_DISJOINT = 8
+#: Retained only so an existing import does not break. The observer rule is
+#: unconditional now; see the module docstring for why gating it on a class's
+#: current photographer count was unsound under growth.
+MIN_OBSERVERS_FOR_DISJOINT = 0
 
 #: dhash Hamming distance at or below which two images are the same evidence.
 NEAR_DUPLICATE_THRESHOLD = 6
@@ -227,7 +248,7 @@ class AssignStats:
     groups_existing: int = 0
     images_joined_existing: int = 0
     quarantined: int = 0
-    cross_class_near_dupes: int = 0
+    near_duplicate_unions: int = 0
     by_rule: dict[str, int] = field(default_factory=dict)
     groups_by_split: dict[str, int] = field(default_factory=dict)
     images_by_split: dict[str, int] = field(default_factory=dict)
@@ -243,7 +264,7 @@ class AssignStats:
             "groups_existing": self.groups_existing,
             "images_joined_existing": self.images_joined_existing,
             "quarantined": self.quarantined,
-            "cross_class_near_dupes": self.cross_class_near_dupes,
+            "near_duplicate_unions": self.near_duplicate_unions,
             "by_rule": self.by_rule,
             "groups_by_split": self.groups_by_split,
             "images_by_split": self.images_by_split,
@@ -310,30 +331,54 @@ class V2SplitStore:
             GROUP BY sha256 HAVING count(DISTINCT species_taxon_id) > 1
             """
         )
-        # One row per distinct image. Keyed by sha256, so exact duplicates
-        # across candidate records collapse here rather than being tie-broken
-        # into a winner and some losers.
+        # Every (image, observation, photographer) relationship, one row each.
+        #
+        # group_key and observer_key are namespaced by source. They are raw
+        # provider identifiers - iNaturalist observer_key is a bare integer
+        # ("2046206"), 308,227 of 308,227 of them - so the moment a second
+        # source lands, its user 2046206 would be silently treated as the same
+        # photographer, and its observation ids could merge two species into one
+        # leak group. candidate_id is already '<source>:<record_id>', so the
+        # namespace is available without touching the candidates table.
         self.con.execute(
             f"""
-            CREATE OR REPLACE TEMP TABLE v2_eligible AS
-            SELECT p.sha256,
-                   any_value(p.species_taxon_id) AS taxon_id,
-                   any_value(p.group_key)        AS group_key,
-                   any_value(p.observer_key)     AS observer_key,
-                   any_value(p.dhash)            AS dhash
-            FROM (
-                SELECT pr.sha256, pr.species_taxon_id, pr.group_key,
-                       pr.observer_key, s.dhash
-                FROM provenance pr
-                LEFT JOIN stored s USING (candidate_id)
-            ) p
-            WHERE p.species_taxon_id IS NOT NULL
-              AND p.sha256 IS NOT NULL
+            CREATE OR REPLACE TEMP TABLE v2_links AS
+            SELECT DISTINCT
+                   pr.sha256,
+                   pr.species_taxon_id AS taxon_id,
+                   split_part(pr.candidate_id, ':', 1) || ':' || pr.group_key
+                       AS group_key,
+                   split_part(pr.candidate_id, ':', 1) || ':' || pr.observer_key
+                       AS observer_key
+            FROM provenance pr
+            WHERE pr.species_taxon_id IS NOT NULL
+              AND pr.sha256 IS NOT NULL
               AND NOT EXISTS (
-                  SELECT 1 FROM v2_conflicting c WHERE c.sha256 = p.sha256
+                  SELECT 1 FROM v2_conflicting c WHERE c.sha256 = pr.sha256
               )
-            GROUP BY p.sha256
             {f'LIMIT {int(limit)}' if limit else ''}
+            """
+        )
+        # One row per distinct image, for the attributes that genuinely are
+        # per-image. taxon_id is safe to collapse because v2_conflicting already
+        # removed every sha carrying more than one; dhash is a function of the
+        # bytes, so identical bytes give an identical hash. The *relationships*
+        # deliberately do not collapse here - see v2_links. Taking any_value of
+        # group_key dropped 923 images' second observation on the real store,
+        # 405 of them into observations holding other images, which is exactly
+        # the edge that keeps a re-post out of the release holdout.
+        self.con.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE v2_eligible AS
+            SELECT l.sha256,
+                   min(l.taxon_id) AS taxon_id,
+                   max(s.dhash)    AS dhash
+            FROM v2_links l
+            LEFT JOIN (
+                SELECT DISTINCT pr.sha256, st.dhash
+                FROM provenance pr JOIN stored st USING (candidate_id)
+            ) s USING (sha256)
+            GROUP BY l.sha256
             """
         )
 
@@ -343,42 +388,54 @@ class V2SplitStore:
     def _components(self, *, near_duplicates: bool, log) -> tuple[dict[str, str], int]:
         """Connected components over the leak-group edges.
 
-        Returns ``(sha256 -> component_root, cross_class_near_dupe_count)``.
+        Returns ``(sha256 -> component_root, near_duplicate_unions)``.
         """
         rows = self.con.execute(
-            "SELECT sha256, taxon_id, group_key, observer_key, dhash FROM v2_eligible"
+            "SELECT sha256, taxon_id, dhash FROM v2_eligible"
         ).fetchall()
         uf = _UnionFind()
-        by_obs: dict[str, str] = {}
         taxon_of: dict[str, int] = {}
-        for sha, taxon, group_key, _observer, _dhash in rows:
+        for sha, taxon, _dhash in rows:
             uf.find(sha)
             taxon_of[sha] = taxon
-            if group_key:
-                # edge 3: every image of one observation
-                first = by_obs.setdefault(group_key, sha)
-                uf.union(first, sha)
+
+        # edge 3: every image of one observation, over *all* links rather than
+        # one arbitrarily chosen per image.
+        by_obs: dict[str, str] = {}
+        obs_links = self.con.execute(
+            "SELECT group_key, sha256 FROM v2_links "
+            "WHERE group_key IS NOT NULL ORDER BY group_key, sha256"
+        ).fetchall()
+        for group_key, sha in obs_links:
+            if sha not in taxon_of:
+                continue
+            first = by_obs.setdefault(group_key, sha)
+            uf.union(first, sha)
         log(f"  {len(rows):,} distinct images, {len(by_obs):,} observations")
 
-        cross_class = 0
+        same_class = 0
         if near_duplicates:
             from .dedupe import near_duplicate_pairs
 
-            pairs = near_duplicate_pairs(
-                [(sha, dhash) for sha, _t, _g, _o, dhash in rows if dhash],
-                threshold=NEAR_DUPLICATE_THRESHOLD,
-            )
-            same_class = 0
-            for a, b, _dist in pairs:
-                if taxon_of.get(a) == taxon_of.get(b):
-                    uf.union(a, b)              # edge 2, same taxon only
+            # Per taxon, not globally. Two reasons, and the first is the one
+            # that matters: only same-taxon pairs are ever unioned, so a global
+            # search computes millions of cross-class pairs it will discard.
+            # The second is that per-taxon inputs are small enough for the
+            # exact blocked brute force in `dedupe`, which cannot miss a pair.
+            by_taxon: dict[int, list[tuple[str, str]]] = {}
+            for sha, taxon, dhash in rows:
+                if dhash:
+                    by_taxon.setdefault(taxon, []).append((sha, dhash))
+            for items in by_taxon.values():
+                for a, b, _dist in near_duplicate_pairs(
+                    items, threshold=NEAR_DUPLICATE_THRESHOLD
+                ):
+                    uf.union(a, b)              # edge 2, same taxon by construction
                     same_class += 1
-                else:
-                    cross_class += 1
-            log(f"  near-duplicate pairs: {same_class:,} same-class (unioned), "
-                f"{cross_class:,} cross-class (reported, not unioned)")
+            log(f"  near-duplicate pairs unioned (same taxon, exact): "
+                f"{same_class:,}")
 
-        return {sha: uf.find(sha) for sha, *_ in rows}, cross_class
+        return {sha: uf.find(sha) for sha, *_ in rows}, same_class
 
     # ------------------------------------------------------------------
     # assignment
@@ -389,7 +446,6 @@ class V2SplitStore:
         batch: str,
         fractions: dict[str, float] | None = None,
         near_duplicates: bool = True,
-        min_observers_for_disjoint: int = MIN_OBSERVERS_FOR_DISJOINT,
         coverage_topup: bool = True,
         limit: int | None = None,
         log=print,
@@ -409,17 +465,22 @@ class V2SplitStore:
             "SELECT count(*) FROM v2_eligible"
         ).fetchone()[0]
 
-        comp, stats.cross_class_near_dupes = self._components(
+        comp, stats.near_duplicate_unions = self._components(
             near_duplicates=near_duplicates, log=log
         )
 
-        meta = {
-            sha: (taxon, observer)
-            for sha, taxon, _g, observer, _d in self.con.execute(
-                "SELECT sha256, taxon_id, group_key, observer_key, dhash "
-                "FROM v2_eligible"
-            ).fetchall()
-        }
+        taxon_of_sha = dict(
+            self.con.execute("SELECT sha256, taxon_id FROM v2_eligible").fetchall()
+        )
+        # Every photographer of every image, not one per image: an image can
+        # legitimately reach us under two accounts (8 such images on the real
+        # store), and the observer rule has to see both or it ties the group to
+        # an arbitrary one of them.
+        observers_of_sha: dict[str, set[str]] = {}
+        for sha, observer in self.con.execute(
+            "SELECT sha256, observer_key FROM v2_links WHERE observer_key IS NOT NULL"
+        ).fetchall():
+            observers_of_sha.setdefault(sha, set()).add(observer)
 
         existing_member = dict(
             self.con.execute(
@@ -449,24 +510,39 @@ class V2SplitStore:
             members.setdefault(root, []).append(sha)
         stats.groups_total = len(members)
 
-        # Observer -> split, per class, from what is already assigned.
+        # Observer -> split, per class, from what is already assigned. Ordered
+        # so the earliest assignment wins deterministically; an unordered
+        # setdefault let whichever row DuckDB returned first decide, which is
+        # not something a rebuild can reproduce.
         observer_split: dict[tuple[int, str], str] = {}
         for taxon, observer, split in self.con.execute(
             "SELECT taxon_id, observer_key, split FROM split_groups "
-            "WHERE dataset_version = ? AND observer_key IS NOT NULL",
+            "WHERE dataset_version = ? AND observer_key IS NOT NULL "
+            "ORDER BY assigned_at, group_id",
             [DATASET_VERSION],
         ).fetchall():
-            observer_split.setdefault((taxon, observer), split)
+            for one in observer.split("\x1f"):
+                observer_split.setdefault((taxon, one), split)
 
         observers_per_class = dict(
             self.con.execute(
-                "SELECT taxon_id, count(DISTINCT observer_key) FROM v2_eligible "
+                "SELECT taxon_id, count(DISTINCT observer_key) FROM v2_links "
                 "GROUP BY taxon_id"
             ).fetchall()
         )
+        def group_taxon(shas: list[str]) -> int:
+            return taxon_of_sha[shas[0]]
+
+        def group_observers(shas: list[str]) -> list[str]:
+            """Every photographer contributing to this leak group, sorted."""
+            out: set[str] = set()
+            for s in shas:
+                out |= observers_of_sha.get(s, set())
+            return sorted(out)
+
         groups_per_class: dict[int, int] = {}
         for root, shas in members.items():
-            taxon = meta[shas[0]][0]
+            taxon = group_taxon(shas)
             groups_per_class[taxon] = groups_per_class.get(taxon, 0) + 1
 
         new_groups: list[tuple] = []
@@ -488,7 +564,7 @@ class V2SplitStore:
         pending: list[tuple[int, float, str, list[str]]] = []
         for root in sorted(members):
             shas = members[root]
-            taxon, observer = meta[shas[0]]
+            taxon = group_taxon(shas)
             touched = {existing_member[s] for s in shas if s in existing_member}
 
             if len(touched) > 1:
@@ -529,98 +605,152 @@ class V2SplitStore:
         groups_per_observer: dict[tuple[int, str | None], int] = {}
 
         for taxon, frac, root, shas in pending:
-            observer = meta[shas[0]][1]
+            observers = group_observers(shas)
             rule = "hash"
             split = band_of(frac, fractions)
 
             if groups_per_class.get(taxon, 0) < MIN_GROUPS_FOR_HOLDOUT:
                 split, rule = "train", "thin_class"
-            elif (
-                observer
-                and observers_per_class.get(taxon, 0) >= min_observers_for_disjoint
-                and (taxon, observer) in observer_split
-            ):
-                split, rule = observer_split[(taxon, observer)], "observer_inherit"
+            else:
+                # Inherit from *any* photographer of this group who already has
+                # a split in this class. Unconditional, deliberately: gating it
+                # on a class having >= N photographers made the rule activate
+                # only once a class had grown, so every photographer assigned
+                # before that point could straddle train and the holdout
+                # permanently - and immutability means it can never be repaired.
+                # The gate also made the outcome depend on the current
+                # photographer count, which is exactly the "depends on how much
+                # data exists right now" coupling V2 exists to remove.
+                inherited = next(
+                    (observer_split[(taxon, o)] for o in observers
+                     if (taxon, o) in observer_split),
+                    None,
+                )
+                if inherited:
+                    split, rule = inherited, "observer_inherit"
 
             decided[root] = (split, rule)
             assigned_now.setdefault((taxon, split), []).append((root, frac))
-            observer_of_group[root] = observer
+            observer_of_group[root] = observers
             taxon_of_group[root] = taxon
-            groups_per_observer[(taxon, observer)] = (
-                groups_per_observer.get((taxon, observer), 0) + 1
-            )
-            if observer:
-                observer_split.setdefault((taxon, observer), split)
+            for one in observers:
+                groups_per_observer[(taxon, one)] = (
+                    groups_per_observer.get((taxon, one), 0) + 1
+                )
+                observer_split.setdefault((taxon, one), split)
 
         # --- deterministic coverage top-up ---------------------------------
-        # A per-class hash is unbiased, so a class can still miss a holdout by
-        # chance: measured on the current store, ~20 of 1,977 classes miss each
-        # 10% split. Where a class has groups to spare, move one *unassigned*
-        # group into the empty split - choosing the group whose fraction sits
-        # nearest the middle of that split's band, which is deterministic given
-        # the batch and does not touch anything already persisted.
+        # A per-class hash is unbiased, and once every group of a photographer
+        # follows that photographer, a class effectively draws once per
+        # photographer rather than once per group. Classes with few
+        # photographers therefore miss splits often: measured on the V1 CAS,
+        # 24 classes had no validation and 9 had no *train* data at all before
+        # this pass existed in its current form.
+        #
+        # So where a class has photographers to spare, move an entire
+        # photographer into the empty split, choosing the one whose mean hash
+        # fraction sits nearest that split's band. Deterministic given the
+        # batch, and it touches nothing already persisted.
         if coverage_topup:
-            persisted_observer_groups = {
-                (taxon, observer): int(n)
-                for taxon, observer, n in self.con.execute(
-                    "SELECT taxon_id, observer_key, count(*) FROM split_groups "
-                    "WHERE dataset_version = ? GROUP BY taxon_id, observer_key",
-                    [DATASET_VERSION],
-                ).fetchall()
-            }
+            persisted_observer_groups: dict[tuple[int, str], int] = {}
+            for taxon_id, observer, n in self.con.execute(
+                "SELECT taxon_id, observer_key, count(*) FROM split_groups "
+                "WHERE dataset_version = ? AND observer_key IS NOT NULL "
+                "GROUP BY taxon_id, observer_key",
+                [DATASET_VERSION],
+            ).fetchall():
+                for one in observer.split(""):
+                    persisted_observer_groups[(taxon_id, one)] = (
+                        persisted_observer_groups.get((taxon_id, one), 0) + int(n)
+                    )
 
-            def _observer_group_total(root: str) -> int:
-                """How many groups this group's photographer holds in its class,
-                counting both this batch and everything already persisted. A
-                photographer with no key at all ties nothing together."""
-                taxon_id = taxon_of_group[root]
-                observer = observer_of_group.get(root)
-                if not observer:
-                    return 0
-                return (
-                    groups_per_observer.get((taxon_id, observer), 0)
-                    + persisted_observer_groups.get((taxon_id, observer), 0)
+            # The unit moved is the *photographer*, not the group, because
+            # that is the unit inheritance ties together. Moving one group of a
+            # photographer who has others would put them on both sides of the
+            # boundary - buying coverage with exactly the leak the observer rule
+            # exists to prevent. Moving all of a photographer's pending groups
+            # keeps disjointness intact and still fills the split.
+            #
+            # Only photographers with nothing persisted yet are movable:
+            # anything already written is immutable.
+            by_class: dict[int, dict[str, list[tuple[str, float]]]] = {}
+            for taxon, frac, root, _shas in pending:
+                primary = (observer_of_group.get(root) or [None])[0]
+                by_class.setdefault(taxon, {}).setdefault(primary, []).append(
+                    (root, frac)
                 )
 
-            by_class: dict[int, list[tuple[str, float]]] = {}
-            for taxon, frac, root, _shas in pending:
-                by_class.setdefault(taxon, []).append((root, frac))
-            for taxon, groups in by_class.items():
+            for taxon, by_observer in by_class.items():
                 if groups_per_class.get(taxon, 0) < MIN_GROUPS_FOR_HOLDOUT:
                     continue
+
+                def movable(observer: str | None) -> bool:
+                    """Movable = every one of this photographer's groups in this
+                    class is still in train, and none is already persisted.
+
+                    The rule that put them there is irrelevant - most groups are
+                    `observer_inherit` precisely because inheritance is doing its
+                    job, and requiring `hash` here meant the top-up almost never
+                    found a donor. What matters is that the whole set moves
+                    together and that nothing immutable is touched.
+                    """
+                    if persisted_observer_groups.get((taxon, observer), 0):
+                        return False
+                    return all(
+                        decided[r][0] == "train" for r, _f in by_observer[observer]
+                    )
+
+                bands = {}
                 acc = 0.0
                 for name in SPLITS:
                     lo, acc = acc, acc + fractions.get(name, 0.0)
-                    if name == "train":
-                        continue
+                    bands[name] = (lo + acc) / 2.0
+
+                for name in SPLITS:
                     have = covered.get((taxon, name), 0) + sum(
-                        1 for r, _f in groups if decided[r][0] == name
+                        1 for groups in by_observer.values()
+                        for r, _f in groups if decided[r][0] == name
                     )
                     if have:
                         continue
-                    # A donor must not be tied to other groups by its
-                    # photographer: moving one group of a photographer who has
-                    # several in this class would put that photographer on both
-                    # sides of the boundary, which is the leak the observer rule
-                    # exists to prevent. Buying coverage with leakage is not a
-                    # trade worth making, so a photographer with more than one
-                    # group in this class is simply not eligible to donate.
-                    donors = [
-                        (r, f) for r, f in groups
-                        if decided[r] == ("train", "hash")
-                        and _observer_group_total(r) <= 1
-                    ]
-                    if not donors:
+                    candidates = [o for o in by_observer if movable(o)]
+                    # Never strip train empty to fill a holdout: a class with no
+                    # training data cannot be learned at all, which is strictly
+                    # worse than a class that cannot be measured.
+                    if name != "train":
+                        remaining_train = [
+                            o for o in by_observer
+                            if any(decided[r][0] == "train"
+                                   for r, _f in by_observer[o])
+                        ]
+                        if len(remaining_train) <= 1:
+                            continue
+                    if not candidates:
                         continue
-                    mid = (lo + acc) / 2.0
-                    pick = min(donors, key=lambda rf: (abs(rf[1] - mid), rf[0]))
-                    decided[pick[0]] = (name, "coverage_topup")
+                    mid = bands[name]
+
+                    def distance(observer):
+                        groups = by_observer[observer]
+                        mean = sum(f for _r, f in groups) / len(groups)
+                        return (abs(mean - mid), str(observer))
+
+                    pick = min(candidates, key=distance)
+                    for r, _f in by_observer[pick]:
+                        decided[r] = (name, "coverage_topup")
+                        for one in (observer_of_group.get(r) or []):
+                            observer_split[(taxon, one)] = name
 
         for taxon, frac, root, shas in pending:
             split, rule = decided[root]
-            observer = meta[shas[0]][1]
+            # A group can have more than one photographer when the same bytes
+            # reached us under two accounts. Store all of them, separated by
+            # , so re-seeding observer_split on a later run sees every tie
+            # rather than an arbitrary one - losing the second one there is how
+            # a photographer would come to straddle two splits.
+            observers = observer_of_group.get(root) or []
             new_groups.append(
-                (DATASET_VERSION, root, split, taxon, observer, rule, batch, now)
+                (DATASET_VERSION, root, split, taxon,
+                 "".join(observers) or None, rule, batch, now)
             )
             for s in shas:
                 new_members.append((DATASET_VERSION, s, root, now))

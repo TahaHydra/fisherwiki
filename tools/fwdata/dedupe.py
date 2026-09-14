@@ -36,12 +36,16 @@ from .provenance import ProvenanceDB
 #: Hamming distance at or below which two images are considered near-duplicates.
 DEFAULT_THRESHOLD = 6
 
-#: Number of 16-bit bands a 64-bit hash is split into for candidate generation.
-#: Two hashes within `threshold` bits must agree exactly on at least one band
-#: when threshold < bands, which makes this an exact (not approximate) filter
-#: for our threshold of 6 over 4 bands.
+#: Bands the 64-bit hash is split into for multi-index hashing. See
+#: :func:`near_duplicate_pairs` for why this is *not* the "one band must match
+#: exactly" scheme it used to be.
 BANDS = 4
 BAND_BITS = 16
+
+#: Above this many hashes, switch from blocked brute force to multi-index
+#: hashing. Brute force is O(n^2) but has no index overhead and is trivially
+#: correct, which is what we want for the per-taxon calls the splitter makes.
+BRUTE_FORCE_MAX = 8192
 
 
 def _hamming(a: int, b: int) -> int:
@@ -52,61 +56,127 @@ def _bands(h: int) -> list[tuple[int, int]]:
     return [((h >> (i * BAND_BITS)) & 0xFFFF, i) for i in range(BANDS)]
 
 
+def _as_uint64(items: list[tuple[str, str]]):
+    import numpy as np
+
+    return np.array([int(d, 16) for _k, d in items], dtype=np.uint64)
+
+
+def _pairs_brute_force(keys, h, threshold):
+    """Every pair, blocked so memory stays bounded. Exact by construction."""
+    import numpy as np
+
+    n = len(h)
+    out: list[tuple[str, str, int]] = []
+    # Keep each comparison block near 32M cells; at 1 byte per popcount result
+    # that is ~32 MB of scratch regardless of how large n gets.
+    block = max(1, min(n, 32_000_000 // max(n, 1)))
+    for i0 in range(0, n, block):
+        i1 = min(i0 + block, n)
+        d = np.bitwise_count(np.bitwise_xor(h[i0:i1, None], h[None, i0:]))
+        ii, jj = np.nonzero(d <= threshold)
+        jj = jj + i0
+        ii = ii + i0
+        keep = ii < jj                      # strict upper triangle, no self-pairs
+        for a, b in zip(ii[keep].tolist(), jj[keep].tolist()):
+            out.append((keys[a], keys[b], int(np.bitwise_count(h[a] ^ h[b]))))
+    return out
+
+
+def _pairs_multi_index(keys, h, threshold, bands=BANDS, band_bits=BAND_BITS):
+    """Multi-index hashing: exact, and scalable past brute force.
+
+    The guarantee: if two hashes are within ``threshold`` bits overall then at
+    least one band differs by at most ``threshold // bands`` bits, because
+    otherwise every band would contribute at least ``threshold // bands + 1``
+    and the total would exceed ``threshold``. So probing each band at that
+    radius cannot miss a pair. Asserted below rather than assumed, since the
+    previous implementation shipped the *stronger* claim (one band identical)
+    without its precondition holding.
+    """
+    import numpy as np
+    from collections import defaultdict
+
+    radius = threshold // bands
+    assert bands * (radius + 1) > threshold, (
+        f"multi-index hashing needs bands*(radius+1) > threshold; "
+        f"bands={bands} radius={radius} threshold={threshold}"
+    )
+    probes = [0] + [1 << k for k in range(band_bits)] if radius >= 1 else [0]
+    if radius > 1:                          # not needed at threshold 6, but be honest
+        raise NotImplementedError(
+            f"probe radius {radius} > 1 is not implemented; lower the threshold "
+            f"or raise BANDS"
+        )
+
+    n = len(h)
+    h_int = h.tolist()
+    out: list[tuple[str, str, int]] = []
+    seen_emitted: set[tuple[int, int]] = set()
+
+    for b in range(bands):
+        shift = b * band_bits
+        mask = (1 << band_bits) - 1
+        buckets: dict[int, list[int]] = defaultdict(list)
+        for i, hv in enumerate(h_int):
+            buckets[(hv >> shift) & mask].append(i)
+
+        for value, members in buckets.items():
+            for probe in probes:
+                other = value ^ probe
+                if probe and other < value:
+                    continue                # handle each unordered value pair once
+                partners = buckets.get(other)
+                if not partners:
+                    continue
+                if probe == 0:
+                    pairs = ((members[x], members[y])
+                             for x in range(len(members))
+                             for y in range(x + 1, len(members)))
+                else:
+                    pairs = ((a, c) for a in members for c in partners)
+                for a, c in pairs:
+                    if a == c:
+                        continue
+                    lo, hi = (a, c) if a < c else (c, a)
+                    if (lo, hi) in seen_emitted:
+                        continue
+                    d = _hamming(h_int[lo], h_int[hi])
+                    if d <= threshold:
+                        seen_emitted.add((lo, hi))
+                        out.append((keys[lo], keys[hi], d))
+    return out
+
+
 def near_duplicate_pairs(
     items: list[tuple[str, str]],
     *,
     threshold: int = DEFAULT_THRESHOLD,
-    max_bucket: int = 5000,
 ) -> list[tuple[str, str, int]]:
-    """``[(key_a, key_b, distance), ...]`` for hashes within ``threshold``.
+    """``[(key_a, key_b, distance), ...]`` for every pair within ``threshold``.
+
+    **Exact**: no pair within ``threshold`` is ever missed. That matters because
+    the V2 splitter builds leak groups from these pairs, and a missed pair puts
+    the same photograph in train and in the sealed release holdout - a silent
+    failure that no metric reveals.
+
+    The previous implementation banded the 64-bit hash into four 16-bit bands
+    and required one band to match *exactly*. Its own comment stated the
+    precondition - "threshold < bands" - and then applied it at threshold 6 with
+    4 bands, where it does not hold. Two hashes differing by one bit in each of
+    the four bands are 4 apart and share no band, so they were silently dropped;
+    `test_four_band_counterexample_is_found` pins exactly that case.
 
     ``items`` is ``[(key, dhash_hex), ...]``; keys are returned as given, so the
     caller decides whether a key is a candidate id, a sha256 or anything else.
-    Split out of :func:`find_duplicates` so the V2 splitter can build leak
-    groups from the same banded index rather than reimplementing it - two
-    implementations of "are these the same photograph" would eventually
-    disagree, and the split is the place where that disagreement would be
-    silent and expensive.
     """
-    buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
-    keys: list[str] = []
-    hashes: list[int] = []
-    for i, (key, dhash) in enumerate(items):
-        h = int(dhash, 16)
-        keys.append(key)
-        hashes.append(h)
-        for band in _bands(h):
-            buckets[band].append(i)
-
-    out: list[tuple[str, str, int]] = []
-    for (_value, band_idx), members in buckets.items():
-        if len(members) < 2 or len(members) > max_bucket:
-            # A bucket with thousands of members is a degenerate hash (a solid
-            # background, usually); comparing it all-pairs costs more than the
-            # information is worth.
-            continue
-        for a_i in range(len(members)):
-            a = members[a_i]
-            ha = hashes[a]
-            for b_i in range(a_i + 1, len(members)):
-                b = members[b_i]
-                hb = hashes[b]
-                # A pair that agrees on several bands turns up in each of them.
-                # Emit it only from the lowest such band instead of keeping a
-                # global set of every pair already seen: on the current store
-                # that set reaches ~17M tuples and costs gigabytes, which is
-                # what made the first full run unusable rather than merely slow.
-                if any(
-                    ((ha >> (j * BAND_BITS)) & 0xFFFF)
-                    == ((hb >> (j * BAND_BITS)) & 0xFFFF)
-                    for j in range(band_idx)
-                ):
-                    continue
-                d = _hamming(ha, hb)
-                if d <= threshold:
-                    out.append((keys[a], keys[b], d) if a < b
-                               else (keys[b], keys[a], d))
-    return out
+    if len(items) < 2:
+        return []
+    keys = [k for k, _ in items]
+    h = _as_uint64(items)
+    if len(items) <= BRUTE_FORCE_MAX:
+        return _pairs_brute_force(keys, h, threshold)
+    return _pairs_multi_index(keys, h, threshold)
 
 
 def find_duplicates(

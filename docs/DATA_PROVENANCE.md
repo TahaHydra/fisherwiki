@@ -308,27 +308,53 @@ component over these edges, strongest first:
    two candidate ids is one node *by construction*. 1,102 hashes in the current
    store arrive under more than one candidate id; V1 tie-broke a winner and the
    losers went on to contaminate the open-set "unseen species" pool.
-2. **Near duplicates** — `dhash` Hamming ≤ 6, via the banded index in
-   [`tools/fwdata/dedupe.py`](../tools/fwdata/dedupe.py) (exact, not approximate,
-   at this threshold). **Same taxon only**, and that restriction is what makes
-   the edge safe. Measured on the V1 CAS: 210,381 pairs clear the threshold and
-   only **2,509 are same-class**. The remaining 204,430 come from just 11,441
-   images (3.7% of the corpus) whose dhash carries almost no information — dark,
-   uniform or low-contrast frames, 29 of them hashing to all zeroes — which
-   therefore collide with everything. Unioning across classes would have merged
-   unrelated species into single leak groups. Those pairs are reported as a
-   **hash-quality** signal, not as label disputes; 204,430 mislabelled images
-   would not be a credible reading. With the restriction in place the largest
-   leak group on the real corpus is 56 images, and 170,030 of 218,444 groups are
-   single images.
+2. **Near duplicates** — `dhash` Hamming ≤ 6, computed **per taxon** with the
+   exact search in [`tools/fwdata/dedupe.py`](../tools/fwdata/dedupe.py).
+
+   "Exact" is load-bearing and was not true at first. The original index banded
+   the 64-bit hash into four 16-bit bands and required one band to match
+   exactly. By pigeonhole that finds every pair only when the threshold is
+   *below* the band count — its own comment said so — and the threshold is 6
+   against 4 bands. Two hashes differing by one bit in each band are 4 apart and
+   share no band. On the V1 CAS that dropped **451 of 2,960 genuine same-taxon
+   pairs, 15%**, each one a chance for the same photograph to sit in train and
+   in the sealed holdout. It now uses blocked brute force below 8,192 hashes and
+   multi-index hashing above, both verified against brute force.
+
+   Searching per taxon rather than globally makes cross-class unions impossible
+   by construction instead of computed and discarded. That restriction matters:
+   globally 210,381 pairs clear the threshold and only ~3,000 are same-class,
+   the rest coming from a few thousand images whose dhash carries almost no
+   information — dark or uniform frames, 29 hashing to all zeroes — which
+   collide with everything. `dataset.py dedupe` still reports those, as the
+   hash-quality signal they are rather than as label disputes.
 3. **Observation / media group** — every image of one `group_key`.
 4. **Photographer** — deliberately **not** a union edge. Making it one is V1's
    OBSERVER strategy, measured and rejected: ~5,500 photographers over 1,978
    classes left 284 classes with no validation images. Instead a new group
-   *inherits* the split its photographer already holds within that class, but
-   only where the class has ≥ 8 distinct photographers, so the rule can never
-   starve a thin class. `split_groups.rule` records which rule decided each row,
-   so the mix is auditable rather than assumed.
+   *inherits* the split any of its photographers already holds within that
+   class — **unconditionally**.
+
+   It was briefly gated on the class having ≥ 8 photographers, which growth
+   breaks: a class assigned while it had 5 got no inheritance, so one
+   photographer's groups landed on both sides of the boundary, and when the
+   class later reached 8 the rule switched on but immutability meant those
+   assignments could never be repaired. The gate also made the outcome depend on
+   the *current* photographer count — the coupling V2 exists to remove. Thin
+   classes are protected by `MIN_GROUPS_FOR_HOLDOUT` and the coverage top-up
+   instead, which is where that protection belongs.
+
+   Because inheritance ties a photographer's groups together, the coverage
+   top-up moves a whole **photographer** into an empty split, never a single
+   group — moving one group of a photographer who has others would buy coverage
+   with exactly the leak the rule prevents. `split_groups.rule` records which
+   rule decided each row.
+
+   One more thing the multi-source future needs: `group_key` and `observer_key`
+   are **namespaced by source** at this layer. They are raw provider ids —
+   iNaturalist's `observer_key` is a bare integer, 308,227 of 308,227 of them —
+   so a second source reusing an id would otherwise be read as the same
+   photographer, or merge two species into one leak group.
 
 When growth bridges two already-assigned groups sitting in different splits
 (a new image near-duplicating both), neither existing assignment moves and the
@@ -402,25 +428,36 @@ nothing.
 
 ### What batch zero actually produces
 
-Measured by running the real assignment against a copy of the live provenance
-database (17.7 s end to end, so this is cheap to re-run):
+Measured by running the real assignment against copies of the live provenance
+database (about 6 s end to end, so this is cheap to re-run), at both candidate
+ratios:
 
-| | |
-|---|---|
-| eligible images | 305,569 (of 310,393 stored; the rest lack a taxon or have a disputed label) |
-| leak groups | 218,444 |
-| images: train / validation / dev_test / final_test | 212,703 / 30,781 / 31,128 / 30,957 |
-| train share | 0.696 against a 0.70 target |
-| decided by rule | hash 85,222 · observer_inherit 132,651 · coverage_topup 571 |
-| classes with no holdout | validation 0 · dev_test 3 · final_test 1 |
-| quarantined | 0 |
-| leakage (groups / hashes / orphans) | 0 / 0 / 0 |
+| | 70/10/10/10 | 80/10/5/5 |
+|---|---|---|
+| eligible images | 305,569 | 305,569 |
+| train images | 207,731 | **235,934** |
+| validation / dev_test / final_test | 32,915 / 32,611 / 32,312 | 33,180 / 18,535 / 17,920 |
+| photographers in final_test | 2,266 | 1,660 |
+| classes clearing the corpus bar | 1,852 | **1,899** |
+| …of those, missing validation / dev_test / final_test | 10 / 11 / 15 | 8 / 11 / 14 |
+| …of those, missing **train** | 0 | 0 |
+| photographer/class pairs spanning splits | 0 | 0 |
+| quarantined | 0 | 0 |
+| leakage (groups / hashes / orphans) | 0 / 0 / 0 | 0 / 0 / 0 |
 
-The coverage numbers are the reason the top-up rule exists: a pure per-class
-hash leaves roughly 20 of 1,977 classes without each holdout split, simulated
-before the rule was written. Observer inheritance plus a deterministic top-up
-takes that to 0–3 without any rank-and-cut, which is the V1 mechanism this
-design exists to avoid.
+**Recommended freeze for a 2–3M corpus: 80/10/5/5.** It is better on every axis
+measured here — 13.6% more training images, *more* classes clearing the bar
+(because the bar counts train images), equal or better holdout coverage, and
+identical leakage guarantees. At 2–3M images a 5% release holdout is still
+100,000–150,000 images, far more than a stable release estimate needs; spending
+10% there buys precision nobody reads and costs training data that shows up in
+accuracy. The default is left at 70/10/10/10 until you confirm, because the
+ratio is frozen for the life of the corpus once the first batch is assigned.
+
+Holdouts run slightly rich against target (validation 10.9% at a 10% setting)
+because the top-up moves whole photographers out of train. That is the intended
+trade: a class that cannot be measured is worse than a split a fraction of a
+point off nominal.
 
 **One deliberate difference from V1, worth a decision rather than a default.**
 V2's class bar counts **train** images (`--min-images`, default 40) rather than
