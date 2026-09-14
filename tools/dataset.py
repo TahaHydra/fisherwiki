@@ -330,6 +330,9 @@ def cmd_v2_status(args: argparse.Namespace) -> int:
             [DATASET_VERSION],
         ).fetchone()[0]
         _log(f"dataset_version {DATASET_VERSION}")
+        frozen = store.stored_fractions()
+        _log(f"  fractions      : "
+             f"{frozen if frozen else '(not frozen yet - set on first assign)'}")
         _log(f"  groups by split: {dict(rows)}")
         _log(f"  images by split: {dict(images)}")
         _log(f"  assignment rule: {dict(rules)}")

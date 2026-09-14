@@ -291,7 +291,7 @@ First assignment of a new group uses a fixed-band hash, not a rank-and-cut:
 
 ```
 fraction = sha256(f"v2:{taxon_id}" + "\0" + group_id)  ->  [0, 1)
-train 0.00-0.70 | validation 0.70-0.80 | dev_test 0.80-0.90 | final_test 0.90-1.00
+train 0.00-0.80 | validation 0.80-0.90 | dev_test 0.90-0.95 | final_test 0.95-1.00
 ```
 
 The per-class salt preserves the stratification V1 needed (every class spread
@@ -432,7 +432,7 @@ Measured by running the real assignment against copies of the live provenance
 database (about 6 s end to end, so this is cheap to re-run), at both candidate
 ratios:
 
-| | 70/10/10/10 | 80/10/5/5 |
+| | 70/10/10/10 | **80/10/5/5** *(chosen)* |
 |---|---|---|
 | eligible images | 305,569 | 305,569 |
 | train images | 207,731 | **235,934** |
@@ -445,14 +445,21 @@ ratios:
 | quarantined | 0 | 0 |
 | leakage (groups / hashes / orphans) | 0 / 0 / 0 | 0 / 0 / 0 |
 
-**Recommended freeze for a 2–3M corpus: 80/10/5/5.** It is better on every axis
-measured here — 13.6% more training images, *more* classes clearing the bar
-(because the bar counts train images), equal or better holdout coverage, and
-identical leakage guarantees. At 2–3M images a 5% release holdout is still
-100,000–150,000 images, far more than a stable release estimate needs; spending
-10% there buys precision nobody reads and costs training data that shows up in
-accuracy. The default is left at 70/10/10/10 until you confirm, because the
-ratio is frozen for the life of the corpus once the first batch is assigned.
+**Frozen at 80/10/5/5.** It is better on every axis measured here — 13.6% more
+training images, *more* classes clearing the bar (because the bar counts train
+images), equal or better holdout coverage, and identical leakage guarantees. At
+2–3M images a 5% release holdout is still 100,000–150,000 images, far more than
+a stable release estimate needs; spending 10% there buys precision nobody reads
+and costs training data that shows up in accuracy.
+
+The ratio is **enforced, not just defaulted**. The first `v2-assign` writes it to
+a `split_config` row, and any later batch asking for different values is refused.
+Changing it mid-corpus would move nothing already assigned — immutability still
+holds — but it would leave different parts of the corpus with different holdout
+proportions, which biases every measurement taken across them and is invisible
+afterwards. `validate_fractions()` additionally rejects any set that does not sum
+to 1, because `band_of()` would otherwise absorb the shortfall into the last
+split rather than failing.
 
 Holdouts run slightly rich against target (validation 10.9% at a 10% setting)
 because the top-up moves whole photographers out of train. That is the intended

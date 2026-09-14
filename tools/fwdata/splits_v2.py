@@ -153,14 +153,50 @@ DATASET_VERSION = "v2"
 
 SPLITS = ("train", "validation", "dev_test", "final_test")
 
+#: Frozen for the life of the V2 corpus.
+#:
+#: Chosen over 70/10/10/10 on measurement, not preference. Run against copies of
+#: the live store, 80/10/5/5 gave 235,934 training images against 207,731
+#: (+13.6%), and *more* classes clearing the corpus bar - 1,899 against 1,852 -
+#: because the bar counts train images. Holdout coverage was equal or better
+#: (8/11/14 classes missing validation/dev_test/final_test against 10/11/15),
+#: and leakage was zero either way.
+#:
+#: At the 2-3M target a 5% release holdout is still 100,000-150,000 images,
+#: far past what a stable release estimate needs; spending 10% there buys
+#: precision nobody reads and costs training data that shows up in accuracy.
+#:
 #: Cumulative bands are built from this order, so it must stay fixed: changing
 #: the order re-bands every unassigned group (assigned ones are immutable).
 DEFAULT_FRACTIONS: dict[str, float] = {
-    "train": 0.70,
+    "train": 0.80,
     "validation": 0.10,
-    "dev_test": 0.10,
-    "final_test": 0.10,
+    "dev_test": 0.05,
+    "final_test": 0.05,
 }
+
+
+def validate_fractions(fractions: dict[str, float]) -> dict[str, float]:
+    """Reject anything that is not a usable set of split fractions.
+
+    A set that does not sum to 1 does not fail loudly - :func:`band_of` simply
+    puts the shortfall into the last split, or never reaches the later ones - so
+    the damage is a silently skewed corpus rather than an error.
+    """
+    missing = set(SPLITS) - set(fractions)
+    if missing:
+        raise ValueError(f"split fractions missing {sorted(missing)}")
+    unknown = set(fractions) - set(SPLITS)
+    if unknown:
+        raise ValueError(f"unknown split(s) in fractions: {sorted(unknown)}")
+    if any(fractions[s] < 0 for s in SPLITS):
+        raise ValueError(f"negative split fraction: {fractions}")
+    total = sum(fractions[s] for s in SPLITS)
+    if abs(total - 1.0) > 1e-9:
+        raise ValueError(
+            f"split fractions must sum to 1.0, got {total:.6f}: {fractions}"
+        )
+    return {s: float(fractions[s]) for s in SPLITS}
 
 #: A class with fewer groups than this keeps all of them in train: a one-group
 #: validation set measures nothing and costs a thin class its only training
@@ -196,6 +232,13 @@ CREATE TABLE IF NOT EXISTS split_group_members (
     PRIMARY KEY (dataset_version, sha256)
 );
 
+CREATE TABLE IF NOT EXISTS split_config (
+    dataset_version VARCHAR PRIMARY KEY,
+    fractions       VARCHAR,
+    frozen_at       TIMESTAMP,
+    frozen_by_batch VARCHAR
+);
+
 CREATE TABLE IF NOT EXISTS split_quarantine (
     dataset_version VARCHAR,
     sha256          VARCHAR,
@@ -227,6 +270,10 @@ def stable_fraction(key: str, salt: str = "") -> float:
     """
     h = hashlib.sha256((salt + "\x00" + key).encode("utf-8")).digest()
     return int.from_bytes(h[:8], "big") / float(1 << 64)
+
+
+def _fmt_fractions(fractions: dict[str, float]) -> str:
+    return "/".join(f"{fractions[s]:g}" for s in SPLITS)
 
 
 def band_of(fraction: float, fractions: dict[str, float]) -> str:
@@ -438,6 +485,55 @@ class V2SplitStore:
         return {sha: uf.find(sha) for sha, *_ in rows}, same_class
 
     # ------------------------------------------------------------------
+    # frozen configuration
+    # ------------------------------------------------------------------
+    def stored_fractions(self) -> dict[str, float] | None:
+        """The fractions this corpus was first assigned with, if any."""
+        row = self.con.execute(
+            "SELECT fractions FROM split_config WHERE dataset_version = ?",
+            [DATASET_VERSION],
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def freeze_fractions(
+        self, fractions: dict[str, float], batch: str, log=print
+    ) -> dict[str, float]:
+        """Record the split ratio on first use; refuse to change it afterwards.
+
+        The ratio is a property of the corpus, not of a run. Assigning batch
+        zero at 80/10/5/5 and a later batch at 70/10/10/10 would not move
+        anything already assigned - immutability holds - but it would give the
+        two halves of the corpus different holdout proportions, which quietly
+        biases every measurement taken across them and is invisible afterwards.
+
+        Stored as a row rather than trusted to a constant, because the constant
+        lives in code that will be edited over the life of the corpus.
+        """
+        wanted = validate_fractions(fractions)
+        existing = self.stored_fractions()
+        if existing is None:
+            self.con.execute(
+                "INSERT INTO split_config VALUES (?,?,?,?)",
+                [DATASET_VERSION, json.dumps(wanted), _utcnow(), batch],
+            )
+            log(f"  froze split fractions {_fmt_fractions(wanted)} "
+                f"(batch {batch!r}); later batches must match")
+            return wanted
+
+        existing = {k: float(v) for k, v in existing.items()}
+        if any(abs(existing[s] - wanted[s]) > 1e-9 for s in SPLITS):
+            raise ValueError(
+                "split fractions were frozen as "
+                f"{_fmt_fractions(existing)} when this corpus was first "
+                f"assigned, but this run asked for {_fmt_fractions(wanted)}.\n"
+                "Changing them now would give different parts of the corpus "
+                "different holdout proportions, which biases every measurement "
+                "taken across them.\n"
+                "Assign with the frozen values, or start a new dataset_version."
+            )
+        return existing
+
+    # ------------------------------------------------------------------
     # assignment
     # ------------------------------------------------------------------
     def assign(
@@ -456,7 +552,7 @@ class V2SplitStore:
         and it never issues an UPDATE against either. Re-running it is safe and
         is how each new acquisition batch is folded in.
         """
-        fractions = fractions or DEFAULT_FRACTIONS
+        fractions = self.freeze_fractions(fractions or DEFAULT_FRACTIONS, batch, log)
         stats = AssignStats(batch=batch)
 
         log(f"assigning V2 splits (batch={batch!r})")

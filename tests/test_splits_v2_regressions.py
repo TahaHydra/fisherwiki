@@ -279,3 +279,104 @@ class TestKeysAreSourceNamespaced:
         )
         assert any(o.startswith("inaturalist:") for o in observers)
         assert any(o.startswith("gbif:") for o in observers)
+
+
+class TestSplitFractionsAreFrozen:
+    """The ratio is a property of the corpus, not of a run.
+
+    Assigning batch zero at one ratio and a later batch at another moves nothing
+    already assigned - immutability still holds - but leaves the two halves of
+    the corpus with different holdout proportions, which biases every
+    measurement taken across them and is invisible afterwards.
+    """
+
+    def test_the_frozen_default_is_80_10_5_5(self):
+        from fwdata.splits_v2 import DEFAULT_FRACTIONS
+
+        assert DEFAULT_FRACTIONS == {
+            "train": 0.80, "validation": 0.10, "dev_test": 0.05, "final_test": 0.05,
+        }
+
+    def test_the_default_sums_to_one(self):
+        from fwdata.splits_v2 import DEFAULT_FRACTIONS, validate_fractions
+
+        assert validate_fractions(DEFAULT_FRACTIONS) == DEFAULT_FRACTIONS
+
+    @pytest.mark.parametrize("bad", [
+        {"train": 0.8, "validation": 0.1, "dev_test": 0.05, "final_test": 0.10},
+        {"train": 0.8, "validation": 0.1, "dev_test": 0.05, "final_test": 0.02},
+        {"train": 0.9, "validation": 0.1, "dev_test": 0.05},
+        {"train": 1.1, "validation": 0.0, "dev_test": 0.0, "final_test": -0.1},
+    ])
+    def test_fractions_that_do_not_sum_to_one_are_refused(self, bad):
+        from fwdata.splits_v2 import validate_fractions
+
+        with pytest.raises(ValueError):
+            validate_fractions(bad)
+
+    def test_unknown_split_names_are_refused(self):
+        from fwdata.splits_v2 import validate_fractions
+
+        with pytest.raises(ValueError, match="unknown"):
+            validate_fractions({"train": 0.8, "validation": 0.1, "dev_test": 0.05,
+                                "final_test": 0.05, "test": 0.0})
+
+    def test_first_assign_records_the_ratio(self, tmp_path, monkeypatch):
+        from fwdata.splits_v2 import DEFAULT_FRACTIONS
+
+        db = _make_store(tmp_path, monkeypatch, _corpus(n_classes=10))
+        with V2SplitStore(db) as store:
+            store.assign(batch="batch0", log=lambda m: None)
+            assert store.stored_fractions() == DEFAULT_FRACTIONS
+
+    def test_a_later_batch_cannot_change_the_ratio(self, tmp_path, monkeypatch):
+        db = _make_store(tmp_path, monkeypatch, _corpus(n_classes=10))
+        with V2SplitStore(db) as store:
+            store.assign(batch="batch0", log=lambda m: None)
+
+        _add_rows(db, [_row(1000, f"later-{g}", f"user-later-{g}") for g in range(8)])
+        with V2SplitStore(db) as store:
+            with pytest.raises(ValueError, match="frozen"):
+                store.assign(
+                    batch="batch1", log=lambda m: None,
+                    fractions={"train": 0.70, "validation": 0.10,
+                               "dev_test": 0.10, "final_test": 0.10},
+                )
+
+    def test_a_later_batch_with_the_frozen_ratio_proceeds(self, tmp_path, monkeypatch):
+        from fwdata.splits_v2 import DEFAULT_FRACTIONS
+
+        db = _make_store(tmp_path, monkeypatch, _corpus(n_classes=10))
+        before = _assign(db, "batch0")
+        _add_rows(db, [_row(1000, f"later-{g}", f"user-later-{g}") for g in range(8)])
+        with V2SplitStore(db) as store:
+            store.assign(batch="batch1", log=lambda m: None,
+                         fractions=dict(DEFAULT_FRACTIONS))
+            after = _assignments(store)
+        assert all(after.get(k) == v for k, v in before.items())
+        assert len(after) > len(before)
+
+    def test_the_frozen_ratio_survives_reopening_the_database(
+        self, tmp_path, monkeypatch
+    ):
+        from fwdata.splits_v2 import DEFAULT_FRACTIONS
+
+        db = _make_store(tmp_path, monkeypatch, _corpus(n_classes=10))
+        with V2SplitStore(db) as store:
+            store.assign(batch="batch0", log=lambda m: None)
+        with V2SplitStore(db) as store:
+            assert store.stored_fractions() == DEFAULT_FRACTIONS
+
+    def test_the_ratio_actually_shapes_the_split(self, tmp_path, monkeypatch):
+        """80/10/5/5 must produce a visibly larger train share than the holdouts,
+        so a silently-ignored config would be caught."""
+        db = _make_store(tmp_path, monkeypatch,
+                         _corpus(n_classes=40, groups_per_class=40,
+                                 observers_per_class=40))
+        with V2SplitStore(db) as store:
+            stats = store.assign(batch="batch0", log=lambda m: None)
+        images = stats.images_by_split
+        total = sum(images.values())
+        assert images["train"] / total > 0.70
+        for holdout in ("dev_test", "final_test"):
+            assert images[holdout] / total < 0.12
