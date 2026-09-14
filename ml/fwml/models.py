@@ -46,6 +46,16 @@ BACKBONES = {
     "efficientnet_b1": ("efficientnet_b1", 1280, 7.8),
     "convnext_tiny": ("convnext_tiny", 768, 28.6),
     "resnet50": ("resnet50", 2048, 25.6),
+    # --- V2 candidates. Measured on this machine at 384px, fp16, batch 24-32:
+    #   efficientnet_v2_s   76.5 img/s   7.8 GB   85 MB fp32 ONNX   71 ms/img CPU
+    #   efficientnet_v2_m   43.5 img/s   6.8 GB
+    #   convnext_tiny       86.9 img/s   4.9 GB  114 MB fp32 ONNX   75 ms/img CPU
+    # EfficientNetV2 is the smaller, slightly faster model on-device; ConvNeXt
+    # trains faster here and needs no SyncBatchNorm under DDP. Both are exposed
+    # so the choice can be made by a pilot run rather than by ImageNet folklore.
+    "efficientnet_v2_s": ("efficientnet_v2_s", 1280, 21.5),
+    "efficientnet_v2_m": ("efficientnet_v2_m", 1280, 54.1),
+    "convnext_small": ("convnext_small", 768, 50.2),
 }
 
 
@@ -146,7 +156,7 @@ def _build_backbone(name: str, pretrained: bool) -> tuple[nn.Module, int]:
     if name.startswith("efficientnet"):
         net.classifier = nn.Identity()
         return net, feat_dim
-    if name == "convnext_tiny":
+    if name.startswith("convnext"):
         net.classifier = nn.Sequential(
             tvm.convnext.LayerNorm2d(feat_dim, eps=1e-6), nn.Flatten(1)
         )

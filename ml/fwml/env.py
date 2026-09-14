@@ -115,11 +115,22 @@ def setup(prefer_gpu: bool = True, quiet: bool = False) -> DeviceInfo:
 
         if sys.platform == "win32":
             # See module docstring. Without this every BatchNorm call fails.
+            #
+            # Disabling it globally also takes convolution off MIOpen, which
+            # measures a 2x loss on a plain conv stack (146 -> 72 img/s). The
+            # narrower fix is `bypass_miopen_norm()` below: leave MIOpen on for
+            # conv and bypass it per-call for normalisation only. On
+            # EfficientNetV2-S at 384 that is worth ~5% end to end (72.8 ->
+            # 76.5 img/s) - far less than the microbenchmark suggests, because
+            # depthwise convolutions dominate that model and MIOpen helps them
+            # much less than it helps dense ones. Kept as the default because
+            # it is strictly faster and strictly equivalent numerically.
             torch.backends.cudnn.enabled = False
             notes.append(
                 "torch.backends.cudnn.enabled=False: ROCm-on-Windows MIOpen "
                 "cannot JIT-compile its BatchNorm kernels (no C++ stdlib "
-                "headers in the wheels). Conv and BN use native PyTorch paths."
+                "headers in the wheels). Conv and BN use native PyTorch paths. "
+                "Call bypass_miopen_norm(model) to re-enable MIOpen for conv."
             )
             notes.append(
                 "fp32 GEMM on this stack measures 1.8 TFLOPS vs 45.5 fp16; "
@@ -184,3 +195,56 @@ def seed_everything(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
+
+
+def bypass_miopen_norm(model):
+    """Wrap every BatchNorm so MIOpen can stay enabled for convolution.
+
+    ROCm-on-Windows MIOpen cannot build its BatchNorm kernels at all, so the
+    blunt fix is to disable MIOpen globally - which also costs convolution its
+    fast path (measured 2x on a plain conv stack). This wraps only the layers
+    that are broken and then re-enables MIOpen. Measured end to end on
+    EfficientNetV2-S @384: 72.8 -> 76.5 img/s. Less than the microbenchmark
+    implies, because that model is dominated by depthwise convolutions, which
+    MIOpen accelerates far less than dense ones.
+
+    Returns the same model, mutated in place. A no-op anywhere MIOpen is not the
+    problem, so it is safe to call unconditionally - but it must be called
+    *before* wrapping in DDP, since it changes the module tree.
+    """
+    import sys as _sys
+
+    import torch
+
+    if (
+        not torch.cuda.is_available()
+        or getattr(torch.version, "hip", None) is None
+        or _sys.platform != "win32"
+    ):
+        return model
+
+    class _NativeNorm(torch.nn.Module):
+        """One normalisation layer, run with MIOpen bypassed. The flag is
+        thread-local and cheap to set, so the per-call cost is noise next to
+        the layer itself."""
+
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+
+        def forward(self, x):
+            with torch.backends.cudnn.flags(enabled=False):
+                return self.inner(x)
+
+    bn_types = (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)
+
+    def _walk(module) -> None:
+        for name, child in module.named_children():
+            if isinstance(child, bn_types):
+                setattr(module, name, _NativeNorm(child))
+            else:
+                _walk(child)
+
+    _walk(model)
+    torch.backends.cudnn.enabled = True
+    return model
