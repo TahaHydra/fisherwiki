@@ -39,6 +39,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ml"))
 
 from fwdata.config import PATHS  # noqa: E402
 
@@ -128,27 +129,54 @@ def run(
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
 
+    import numpy as np
+    import torch
+
+    from fwml.crop_v2 import PAD_RGB
+
+    imgsz = 640
+
+    def _letterbox_640(im):
+        """Pad to a uniform square so a real batch can be formed.
+
+        Passing variable-size images to ultralytics silently degrades to
+        batch-of-one: measured 4 img/s against 95 img/s for a uniform tensor
+        batch, a 24x difference that decides whether detecting 480k images takes
+        1.4 hours or 33. Padding rather than stretching also keeps the boxes
+        honest - a stretched frame yields a box for a shape the fish never had.
+        """
+        w, h = im.size
+        scale = imgsz / max(w, h)
+        nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+        canvas = Image.new("RGB", (imgsz, imgsz), PAD_RGB)
+        canvas.paste(im.resize((nw, nh), Image.BILINEAR), (0, 0))
+        return canvas, scale
+
     for i in range(0, total, batch):
         chunk = rows[i:i + batch]
-        images, keep = [], []
+        tensors, keep = [], []
         for sha, rel in chunk:
-            p = cas / rel if rel else None
-            if p is None or not p.exists():
+            fp = cas / rel if rel else None
+            if fp is None or not fp.exists():
                 continue
             try:
-                im = Image.open(p).convert("RGB")
+                with Image.open(fp) as im:
+                    im = im.convert("RGB")
+                    size = im.size
+                    padded, scale = _letterbox_640(im)
             except Exception:
                 continue
-            images.append(im)
-            keep.append((sha, im.size))
-        if not images:
+            tensors.append(torch.from_numpy(np.asarray(padded)).permute(2, 0, 1))
+            keep.append((sha, size, scale))
+        if not tensors:
             continue
 
-        import numpy as np
+        stack = torch.stack(tensors).float().div(255)
+        if torch.cuda.is_available():
+            stack = stack.cuda(non_blocking=True)
+        preds = model.predict(stack, conf=conf, iou=iou, verbose=False)
 
-        preds = model.predict([np.asarray(im)[:, :, ::-1] for im in images],
-                              conf=conf, iou=iou, verbose=False)
-        for (sha, (w, h)), res in zip(keep, preds):
+        for (sha, (w, h), scale), res in zip(keep, preds):
             boxes = res.boxes.data.tolist() if res.boxes is not None else []
             done += 1
             if not boxes:
@@ -156,9 +184,19 @@ def run(
                                 "detector", MODEL_NAME, False, now))
                 continue
             best = max(boxes, key=lambda b: b[4])
-            x0, y0, x1, y1, score = best[0], best[1], best[2], best[3], best[4]
+            # Back out of letterbox space. The padding sits bottom/right, so
+            # only the scale has to be undone, but the result still has to be
+            # clamped: a box can legitimately touch the padded edge.
+            x0 = max(0.0, min(w, best[0] / scale))
+            y0 = max(0.0, min(h, best[1] / scale))
+            x1 = max(0.0, min(w, best[2] / scale))
+            y1 = max(0.0, min(h, best[3] / scale))
+            if x1 - x0 < 2 or y1 - y0 < 2:
+                pending.append((sha, None, None, None, None, None, None,
+                                len(boxes), "detector", MODEL_NAME, False, now))
+                continue
             area = ((x1 - x0) * (y1 - y0)) / float(max(1, w * h))
-            pending.append((sha, x0, y0, x1, y1, score, area, len(boxes),
+            pending.append((sha, x0, y0, x1, y1, best[4], area, len(boxes),
                             "detector", MODEL_NAME, True, now))
             found += 1
 
@@ -218,7 +256,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--limit", type=int, default=None)
-    ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--batch", type=int, default=16,
+                    help="16 measured fastest; 64 thrashes VRAM to 8 img/s")
     ap.add_argument("--conf", type=float, default=0.25)
     ap.add_argument("--iou", type=float, default=0.45)
     ap.add_argument("--fetch-weights", action="store_true")
