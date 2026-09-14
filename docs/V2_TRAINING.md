@@ -181,8 +181,36 @@ duplicated decode. Ranks receive an equal shard count (the remainder is dropped
 for that epoch) because an uneven split deadlocks the gradient all-reduce when
 one rank runs out of batches early.
 
-State dicts are stored **unwrapped**, so a checkpoint moves between 1 and N GPUs
-in either direction. The CUDA RNG restore tolerates a changed device count rather
+Three rules keep ranks in lockstep, each closing a failure that is invisible on
+one GPU and hangs on four:
+
+* **The data cursor is per rank.** `samples_this_epoch` indexes this rank's own
+  slice and advances by the *local* batch. Advancing it by the global batch makes
+  every rank skip `world_size` times too far on resume — at 4 GPUs, three
+  quarters of each resumed epoch never trained on, with nothing in the loss curve
+  to show it.
+* **Stop decisions are all-reduced** (`sync_stop`, MAX) before any rank acts, so
+  every rank leaves on the same optimizer step. A preemption SIGTERM reaches
+  ranks at different times; without this the first one out blocks the rest
+  forever in the gradient all-reduce.
+* **Batches are always full.** A failed decode substitutes another row (carrying
+  its own label) rather than shortening or dropping the batch, because an unequal
+  step count between ranks hangs the all-reduce the same way.
+
+Only rank 0 writes checkpoints, between two barriers: the state it serialises
+corresponds to a step every rank has finished, and no rank proceeds until the
+write is durable.
+
+**Moving a run between world sizes.** Weights, optimizer, scheduler and scaler
+move between 1 and N GPUs in either direction — state dicts are stored
+unwrapped. The *data position* cannot: the stream is a function of
+`(seed, epoch, world_size, rank)`, so a cursor recorded under one world size
+names no position under another. When the world size changes, the trainer
+**restarts the current epoch** and keeps everything else. That is bounded
+duplication (at most one epoch of samples re-seen) with zero omission, chosen
+over a world-size-independent global cursor because the latter needs the epoch
+permutation materialised and re-partitioned — a lot of machinery to save at most
+one epoch. The CUDA RNG restore likewise tolerates a changed device count rather
 than refusing to resume.
 
 Portability is close to free here because ROCm exposes the `torch.cuda` API, so

@@ -54,8 +54,18 @@ class TrainerState:
 
     epoch: int = 0
     global_step: int = 0
+    #: **Per rank, not global.** It indexes this rank's own slice of the data
+    #: stream, which is what ``ShardStream.epoch_rows(skip=...)`` consumes.
+    #: Storing a global count here and skipping by it makes every rank skip
+    #: `world_size` times too far - on 4 GPUs, three quarters of every resumed
+    #: epoch would be silently dropped.
     samples_this_epoch: int = 0
+    #: Global across ranks. Reporting only; nothing indexes with it.
     samples_total: int = 0
+    #: World size that produced ``samples_this_epoch``. The stream partition is
+    #: a function of world size, so a cursor taken under a different one does
+    #: not describe a position in this one - see `world_size_changed`.
+    world_size: int = 1
     best_metric: float = float("-inf")
     best_epoch: int = -1
     seconds_trained: float = 0.0
@@ -69,6 +79,7 @@ class TrainerState:
             "global_step": self.global_step,
             "samples_this_epoch": self.samples_this_epoch,
             "samples_total": self.samples_total,
+            "world_size": self.world_size,
             "best_metric": self.best_metric,
             "best_epoch": self.best_epoch,
             "seconds_trained": self.seconds_trained,

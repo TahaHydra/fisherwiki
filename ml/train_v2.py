@@ -46,8 +46,30 @@ so there is no sampler coordination and no duplicated decode work. Ranks are
 given an equal shard count (the remainder is dropped for the epoch) because an
 uneven split deadlocks the gradient all-reduce when one rank finishes early.
 
-Checkpoints store unwrapped state dicts, so a run started on one GPU can resume
-on eight and vice versa.
+Three rules keep ranks in lockstep, and all three matter on a preemptible box:
+
+* **The data cursor is per rank.** ``samples_this_epoch`` indexes this rank's
+  own slice, so it advances by the local batch, never the global one. Advancing
+  it globally makes each rank skip ``world_size`` times too far on resume - at 4
+  GPUs, three quarters of every resumed epoch silently never trained on.
+* **Stop decisions are reduced across ranks** before anyone acts (see
+  :func:`sync_stop`). A SIGTERM lands on one rank first; without the reduce that
+  rank leaves the loop while the others block forever in the gradient
+  all-reduce - a hang, not a crash.
+* **Batches are always full.** A failed decode substitutes another row rather
+  than shortening or dropping a batch, because an unequal number of optimizer
+  steps between ranks hangs the all-reduce the same way.
+
+Only rank 0 writes checkpoints, between two barriers, so the state it serialises
+corresponds to a step every rank has finished and nobody proceeds until the
+write is durable.
+
+Checkpoints store unwrapped state dicts, so weights, optimizer, scheduler and
+scaler move between 1 and 8 GPUs in either direction. The *data position* does
+not: the stream is a function of ``(seed, epoch, world_size, rank)``, so a
+cursor taken under one world size names no position under another. When the
+world size changes the current epoch restarts - bounded duplication, zero
+omission - and everything else carries over. See :func:`world_size_changed`.
 """
 
 from __future__ import annotations
@@ -159,12 +181,29 @@ class ShardRowDataset(Dataset):
 
         self._ensure()
         assert self._index is not None and self._reader is not None
+
+        # A failed decode substitutes a neighbouring row rather than returning
+        # None. Dropping a sample would shorten one rank's batch - or empty it
+        # entirely - and under DDP that desynchronises the optimizer step count,
+        # which hangs the gradient all-reduce rather than failing loudly. The
+        # substitute carries its *own* label, so this never mislabels anything;
+        # it only means a rare unreadable image is replaced by a readable one.
         row = self.rows[i]
-        try:
-            raw = self._reader.read(row)
-            img = Image.open(io.BytesIO(raw)).convert("RGB")
-        except Exception:
-            return None
+        img = None
+        for attempt in range(4):
+            candidate = self.rows[(i + attempt * 7919) % len(self.rows)]
+            try:
+                raw = self._reader.read(candidate)
+                img = Image.open(io.BytesIO(raw)).convert("RGB")
+                row = candidate
+                break
+            except Exception:
+                continue
+        if img is None:
+            raise RuntimeError(
+                f"could not decode any of 4 candidate samples near row {row}; "
+                f"the shard set is likely corrupt - run verify_shards()"
+            )
         if self.train:
             rng = _random.Random(
                 (self.seed * 1_000_003 + self.epoch * 7_919_837 + row) & 0x7FFFFFFF
@@ -179,10 +218,10 @@ class ShardRowDataset(Dataset):
         return to_tensor(img), int(cls)
 
 
-def collate_skip_none(batch):
-    batch = [b for b in batch if b is not None]
-    if not batch:
-        return None
+def collate_batch(batch):
+    """Every item is valid by construction - see ShardRowDataset.__getitem__,
+    which substitutes rather than returning None, so batches are always full
+    and every rank takes the same number of optimizer steps."""
     xs = torch.stack([b[0] for b in batch])
     ys = torch.tensor([b[1] for b in batch], dtype=torch.long)
     return xs, ys
@@ -255,6 +294,63 @@ def is_main(rank: int) -> bool:
     return rank == 0
 
 
+def advance_counters(state: TrainerState, local_batch: int, world: int) -> None:
+    """Advance the two counters, which mean different things.
+
+    ``samples_this_epoch`` is **per rank**: it is the skip offset into this
+    rank's own slice of the stream. ``samples_total`` is **global**, and exists
+    only for reporting throughput.
+
+    Conflating them is not a rounding error. Incrementing the per-rank cursor by
+    the global batch makes each rank skip ``world_size`` times too far on
+    resume, so on 4 GPUs three quarters of every resumed epoch is silently never
+    trained on - and nothing in the loss curve would show it.
+    """
+    state.samples_this_epoch += local_batch
+    state.samples_total += local_batch * world
+
+
+def sync_stop(local_stop: bool, world: int, device) -> bool:
+    """Agree a stop decision across all ranks.
+
+    Every rank must leave the loop on the same optimizer step. If one rank stops
+    while another is still training, the one still training blocks forever in
+    the gradient all-reduce, and the one that stopped blocks in the teardown
+    barrier - a hang, not a crash, which on a rented interruptible box means
+    paying for a dead machine until someone notices.
+
+    A max-reduce means *any* rank requesting a stop stops all of them, which is
+    the right polarity: SIGTERM from a preemption may land on one rank first.
+    """
+    if world <= 1:
+        return local_stop
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        return local_stop
+    flag = torch.tensor([1.0 if local_stop else 0.0], device=device)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    return bool(flag.item() > 0)
+
+
+def barrier(world: int) -> None:
+    if world <= 1:
+        return
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        dist.barrier()
+
+
+def world_size_changed(state: TrainerState, world: int) -> bool:
+    """Whether the stored data cursor describes a different partitioning.
+
+    The stream is a function of ``(seed, epoch, world_size, rank)``, so a cursor
+    recorded under one world size names no position under another.
+    """
+    return int(state.world_size or 1) != int(world)
+
+
 # ---------------------------------------------------------------------------
 # training
 # ---------------------------------------------------------------------------
@@ -316,11 +412,31 @@ def train(cfg: V2Config, hours: float | None, resume: bool, log=print) -> int:
             scaler.load_state_dict(ckpt["scaler"])
         state = TrainerState.from_dict(ckpt["state"])
         restore_rng(ckpt.get("rng", {}))
+        if world_size_changed(state, world):
+            # Restart the current epoch rather than misinterpret the cursor.
+            #
+            # The alternative - a world-size-independent global cursor that
+            # repartitions on resume - is genuinely more efficient but needs the
+            # epoch permutation to be materialised globally and re-split, which
+            # is a lot of machinery to save at most one epoch of duplicated
+            # work. Model, optimizer, scheduler and scaler all carry over, so
+            # what is lost is bounded by the samples already seen in *this*
+            # epoch. Nothing is omitted: the epoch is simply replayed in full
+            # under the new partitioning.
+            if is_main(rank):
+                log(f"world size changed {state.world_size} -> {world}; "
+                    f"restarting epoch {state.epoch} "
+                    f"(discarding a {state.samples_this_epoch:,}-sample "
+                    f"per-rank cursor; weights and optimizer are kept)")
+            state.samples_this_epoch = 0
+        state.world_size = world
         if is_main(rank):
             log(f"resumed: epoch {state.epoch}, step {state.global_step:,}, "
-                f"{state.samples_this_epoch:,} samples into this epoch")
+                f"{state.samples_this_epoch:,} samples into this epoch "
+                f"(per rank, world={world})")
     elif is_main(rank):
         log("starting a new run")
+    state.world_size = world
 
     if world > 1:
         model = nn.parallel.DistributedDataParallel(model, device_ids=[local])
@@ -353,15 +469,13 @@ def train(cfg: V2Config, hours: float | None, resume: bool, log=print) -> int:
             loader = DataLoader(
                 ds, batch_size=cfg.batch_size, shuffle=False,
                 num_workers=cfg.workers, pin_memory=info.is_gpu,
-                collate_fn=collate_skip_none, drop_last=True,
+                collate_fn=collate_batch, drop_last=True,
                 persistent_workers=cfg.workers > 0,
                 prefetch_factor=4 if cfg.workers else None,
             )
             model.train()
             last_ckpt = time.time()
             for batch in loader:
-                if batch is None:
-                    continue
                 t0 = time.time()
                 x, y = batch
                 x = x.to(device, non_blocking=True)
@@ -383,35 +497,51 @@ def train(cfg: V2Config, hours: float | None, resume: bool, log=print) -> int:
                     scheduler.step()
 
                 state.global_step += 1
-                state.samples_this_epoch += x.size(0) * world
-                state.samples_total += x.size(0) * world
+                advance_counters(state, x.size(0), world)
                 step_time = 0.9 * step_time + 0.1 * (time.time() - t0) if step_time else \
                     time.time() - t0
 
-                due = (time.time() - last_ckpt) >= cfg.checkpoint_minutes * 60
-                stopping, reason = stop.should_stop(step_time)
-                if (due or stopping) and is_main(rank):
-                    stop.critical(True)
-                    state.seconds_trained += time.time() - started
-                    started = time.time()
-                    manager.save_training_state(
-                        model=model, optimizer=optimizer, scheduler=scheduler,
-                        scaler=scaler, state=state, config=asdict(cfg),
-                    )
-                    stop.critical(False)
+                # Every rank must reach the same verdict on the same step, so
+                # the decision is reduced across ranks before anyone acts on it.
+                # Reducing every step costs one tiny all-reduce alongside the
+                # gradient all-reduce already happening; deciding locally costs
+                # a hang on a preempted machine.
+                local_due = (time.time() - last_ckpt) >= cfg.checkpoint_minutes * 60
+                local_stop, reason = stop.should_stop(step_time)
+                stopping = sync_stop(local_stop, world, device)
+                due = sync_stop(local_due, world, device)
+
+                if due or stopping:
+                    # Quiesce before writing: rank 0 serialises state that must
+                    # correspond to a step every rank has finished.
+                    barrier(world)
+                    if is_main(rank):
+                        stop.critical(True)
+                        state.seconds_trained += time.time() - started
+                        started = time.time()
+                        manager.save_training_state(
+                            model=model, optimizer=optimizer, scheduler=scheduler,
+                            scaler=scaler, state=state, config=asdict(cfg),
+                        )
+                        stop.critical(False)
+                        log(f"  checkpoint @ step {state.global_step:,} "
+                            f"({state.samples_this_epoch:,} samples this epoch "
+                            f"per rank, loss {loss.item():.3f})")
                     last_ckpt = time.time()
-                    log(f"  checkpoint @ step {state.global_step:,} "
-                        f"({state.samples_this_epoch:,} samples this epoch, "
-                        f"loss {loss.item():.3f})")
+                    # Nobody proceeds until the write is durable, so a
+                    # preemption between these two barriers still leaves a
+                    # complete checkpoint rather than a half-written one.
+                    barrier(world)
                 if stopping:
                     if is_main(rank):
-                        log(f"stopping: {reason}")
+                        log(f"stopping: {reason or 'requested by another rank'}")
                     _finish(world)
                     return 0
 
         # epoch complete
         state.epoch += 1
         state.samples_this_epoch = 0
+        barrier(world)
         if is_main(rank):
             state.history.append({
                 "epoch": state.epoch, "step": state.global_step,
@@ -424,6 +554,7 @@ def train(cfg: V2Config, hours: float | None, resume: bool, log=print) -> int:
             )
             manager.save_best(model=model, state=state, config=asdict(cfg))
             log(f"epoch {state.epoch} complete")
+        barrier(world)
 
     if is_main(rank):
         log("run finished")
