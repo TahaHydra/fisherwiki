@@ -65,6 +65,68 @@ CREATE TABLE IF NOT EXISTS detections (
 """
 
 
+def _letterbox_square(im, imgsz: int):
+    """Pad to a uniform square so a real batch can be formed.
+
+    Variable-size inputs make ultralytics fall back to batch-of-one: measured
+    4 img/s against 87 for a uniform tensor batch. Padding rather than
+    stretching also keeps the boxes honest - a stretched frame yields a box for
+    a shape the fish never had.
+    """
+    from PIL import Image
+
+    from fwml.crop_v2 import PAD_RGB
+
+    w, h = im.size
+    scale = imgsz / max(w, h)
+    nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+    canvas = Image.new("RGB", (imgsz, imgsz), PAD_RGB)
+    canvas.paste(im.resize((nw, nh), Image.BILINEAR), (0, 0))
+    return canvas, scale
+
+
+class _DetectSet:
+    """Decodes and letterboxes one image. Module level so Windows `spawn` can
+    pickle it into DataLoader workers."""
+
+    def __init__(self, items, cas_root, imgsz=640):
+        self.items = items
+        self.cas_root = cas_root
+        self.imgsz = imgsz
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, i):
+        import numpy as np
+        import torch
+        from PIL import Image
+
+        sha, rel = self.items[i]
+        fp = self.cas_root / rel if rel else None
+        if fp is None or not fp.exists():
+            return None
+        try:
+            with Image.open(fp) as im:
+                im = im.convert("RGB")
+                size = im.size
+                padded, scale = _letterbox_square(im, self.imgsz)
+            arr = torch.from_numpy(np.asarray(padded).copy()).permute(2, 0, 1)
+            return sha, size[0], size[1], scale, arr
+        except Exception:
+            return None
+
+
+def _collate_detect(items):
+    import torch
+
+    items = [x for x in items if x is not None]
+    if not items:
+        return None
+    meta = [(s, (w, h), sc) for s, w, h, sc, _ in items]
+    return meta, torch.stack([a for *_, a in items])
+
+
 def _log(msg: str = "") -> None:
     print(msg, flush=True)
 
@@ -73,12 +135,15 @@ def run(
     *,
     limit: int | None = None,
     batch: int = 16,
+    decode_workers: int = 8,
     conf: float = 0.25,
     iou: float = 0.45,
     db_path: Path | None = None,
     log=_log,
 ) -> dict:
     import duckdb
+    import numpy as np  # noqa: F401  (used by the worker dataset)
+    import torch
     from PIL import Image
     from ultralytics import YOLO
 
@@ -111,6 +176,11 @@ def run(
         return {"processed": 0}
 
     model = YOLO(str(weights))
+    # YOLO() loads to CPU regardless of what you later feed it. Measured on the
+    # same 96 images: 83 img/s left on CPU, 98 img/s moved to the GPU. Small,
+    # because a nano detector is CPU-competitive - but free.
+    if torch.cuda.is_available():
+        model.model.to("cuda")
     cas = PATHS.cas
     done = found = 0
     pending: list[tuple] = []
@@ -134,44 +204,32 @@ def run(
 
     from fwml.crop_v2 import PAD_RGB
 
-    imgsz = 640
 
-    def _letterbox_640(im):
-        """Pad to a uniform square so a real batch can be formed.
+    # Decode in worker *processes*, overlapped with inference.
+    #
+    # Profiled on cold images: decode 62 img/s, upload 526, inference 84. Run
+    # strictly in sequence that is ~33 img/s at best, and the real run measured
+    # 14-19 because the images are scattered across 480k files on a spinning
+    # disk, which needs queue depth to go fast and gets none from one reader.
+    # A thread pool inside the loop did not help (19 img/s) because decode and
+    # inference still alternate - the GPU idles through every decode.
+    #
+    # A DataLoader gives both: several processes reading at once, so the disk
+    # sees a real queue, and prefetch, so decode for the next batch overlaps
+    # inference on the current one.
+    from torch.utils.data import DataLoader
 
-        Passing variable-size images to ultralytics silently degrades to
-        batch-of-one: measured 4 img/s against 95 img/s for a uniform tensor
-        batch, a 24x difference that decides whether detecting 480k images takes
-        1.4 hours or 33. Padding rather than stretching also keeps the boxes
-        honest - a stretched frame yields a box for a shape the fish never had.
-        """
-        w, h = im.size
-        scale = imgsz / max(w, h)
-        nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
-        canvas = Image.new("RGB", (imgsz, imgsz), PAD_RGB)
-        canvas.paste(im.resize((nw, nh), Image.BILINEAR), (0, 0))
-        return canvas, scale
+    loader = DataLoader(
+        _DetectSet(rows, cas), batch_size=batch, shuffle=False,
+        num_workers=decode_workers, collate_fn=_collate_detect,
+        prefetch_factor=4 if decode_workers else None,
+    )
 
-    for i in range(0, total, batch):
-        chunk = rows[i:i + batch]
-        tensors, keep = [], []
-        for sha, rel in chunk:
-            fp = cas / rel if rel else None
-            if fp is None or not fp.exists():
-                continue
-            try:
-                with Image.open(fp) as im:
-                    im = im.convert("RGB")
-                    size = im.size
-                    padded, scale = _letterbox_640(im)
-            except Exception:
-                continue
-            tensors.append(torch.from_numpy(np.asarray(padded)).permute(2, 0, 1))
-            keep.append((sha, size, scale))
-        if not tensors:
+    for loaded in loader:
+        if loaded is None:
             continue
-
-        stack = torch.stack(tensors).float().div(255)
+        keep, stack = loaded
+        stack = stack.float().div(255)
         if torch.cuda.is_available():
             stack = stack.cuda(non_blocking=True)
         preds = model.predict(stack, conf=conf, iou=iou, verbose=False)
@@ -184,9 +242,9 @@ def run(
                                 "detector", MODEL_NAME, False, now))
                 continue
             best = max(boxes, key=lambda b: b[4])
-            # Back out of letterbox space. The padding sits bottom/right, so
-            # only the scale has to be undone, but the result still has to be
-            # clamped: a box can legitimately touch the padded edge.
+            # Back out of letterbox space. Padding sits bottom-right, so only
+            # the scale has to be undone, but the result is still clamped: a box
+            # can legitimately touch the padded edge.
             x0 = max(0.0, min(w, best[0] / scale))
             y0 = max(0.0, min(h, best[1] / scale))
             x1 = max(0.0, min(w, best[2] / scale))
@@ -258,6 +316,8 @@ def main(argv=None) -> int:
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--batch", type=int, default=16,
                     help="16 measured fastest; 64 thrashes VRAM to 8 img/s")
+    ap.add_argument("--decode-workers", type=int, default=12,
+                    help="decode worker processes; decode+disk is the bottleneck, not the GPU")
     ap.add_argument("--conf", type=float, default=0.25)
     ap.add_argument("--iou", type=float, default=0.45)
     ap.add_argument("--fetch-weights", action="store_true")
@@ -266,7 +326,8 @@ def main(argv=None) -> int:
     if args.fetch_weights:
         fetch_weights()
         return 0
-    run(limit=args.limit, batch=args.batch, conf=args.conf, iou=args.iou)
+    run(limit=args.limit, batch=args.batch, conf=args.conf, iou=args.iou,
+        decode_workers=args.decode_workers)
     return 0
 
 
