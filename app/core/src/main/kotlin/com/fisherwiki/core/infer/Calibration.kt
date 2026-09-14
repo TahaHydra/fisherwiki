@@ -1,5 +1,6 @@
 package com.fisherwiki.core.infer
 
+import com.fisherwiki.core.model.RejectionReason
 import com.fisherwiki.core.pack.CalibrationSpec
 import kotlin.math.exp
 import kotlin.math.ln
@@ -153,20 +154,17 @@ object Calibration {
         )
     }
 
-    /** Why a result was judged uncertain, so the UI can say something useful. */
-    enum class RejectionReason {
-        NONE,
-        LOW_CONFIDENCE,
-        NARROW_MARGIN,
-        HIGH_ENTROPY,
-        BELOW_CLASS_THRESHOLD,
-    }
-
     /**
      * Decide whether the top class may be reported as a species-level answer.
      *
      * Returns [RejectionReason.NONE] when it may. Checks run in order of how
      * informative they are to a user.
+     *
+     * [RejectionReason] lives in `com.fisherwiki.core.model`, not here: it is
+     * a domain fact about the result ("why was this uncertain"), the same
+     * kind of thing [Certainty] is, not an implementation detail of this
+     * calibration algorithm - see its kdoc for why that distinction is load
+     * bearing rather than cosmetic.
      */
     fun reject(dist: Distribution, spec: CalibrationSpec): RejectionReason {
         val p = dist.bestProbability

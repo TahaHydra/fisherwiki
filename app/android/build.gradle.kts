@@ -128,6 +128,14 @@ dependencies {
     testImplementation(libs.truth)
     testRuntimeOnly(libs.junit.platform.launcher)
 
+    // Robolectric tests real android.* code (PackManager: Context, File,
+    // ContentResolver) on the JVM. Its runner is JUnit4-native; the vintage
+    // engine runs those alongside the Jupiter tests above under one
+    // useJUnitPlatform() rather than needing a second test task.
+    testImplementation(libs.robolectric)
+    testImplementation(libs.junit4)
+    testRuntimeOnly(libs.junit.vintage.engine)
+
     androidTestImplementation(libs.androidx.test.junit)
     androidTestImplementation(libs.androidx.test.espresso.core)
 }

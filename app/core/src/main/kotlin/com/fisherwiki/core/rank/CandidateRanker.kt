@@ -5,6 +5,7 @@ import com.fisherwiki.core.model.Candidate
 import com.fisherwiki.core.model.Certainty
 import com.fisherwiki.core.model.Identification
 import com.fisherwiki.core.model.Rank
+import com.fisherwiki.core.model.RejectionReason
 import com.fisherwiki.core.model.Taxon
 import com.fisherwiki.core.pack.CalibrationSpec
 import kotlin.math.ln
@@ -93,6 +94,7 @@ class CandidateRanker(
                 normalizedEntropy = dist.normalizedEntropy,
                 packId = packId, packVersion = packVersion,
                 inferenceMillis = inferenceMillis,
+                rejectionReason = RejectionReason.NO_CANDIDATE,
             )
         }
 
@@ -108,13 +110,14 @@ class CandidateRanker(
         val reason = rejectionFor(best, adjMargin, adjEntropy)
 
         return when (reason) {
-            Calibration.RejectionReason.NONE -> Identification(
+            RejectionReason.NONE -> Identification(
                 certainty = if (adjMargin < calibration.marginThreshold * 2.5f)
                     Certainty.AMBIGUOUS else Certainty.CONFIDENT,
                 best = best,
                 alternatives = candidates.drop(1).take(topK - 1),
                 normalizedEntropy = adjEntropy,
                 margin = adjMargin,
+                rejectionReason = RejectionReason.NONE,
                 geoApplied = geoApplied,
                 packId = packId,
                 packVersion = packVersion,
@@ -130,6 +133,7 @@ class CandidateRanker(
                 packId = packId,
                 packVersion = packVersion,
                 inferenceMillis = inferenceMillis,
+                reason = reason,
             )
         }
     }
@@ -138,21 +142,21 @@ class CandidateRanker(
         best: Candidate,
         margin: Float,
         entropy: Float,
-    ): Calibration.RejectionReason {
+    ): RejectionReason {
         val perClass = calibration.perClassThreshold[best.classIndex.toString()]
         if (perClass != null && best.probability < perClass) {
-            return Calibration.RejectionReason.BELOW_CLASS_THRESHOLD
+            return RejectionReason.BELOW_CLASS_THRESHOLD
         }
         if (best.probability < calibration.unknownThreshold) {
-            return Calibration.RejectionReason.LOW_CONFIDENCE
+            return RejectionReason.LOW_CONFIDENCE
         }
         if (margin < calibration.marginThreshold) {
-            return Calibration.RejectionReason.NARROW_MARGIN
+            return RejectionReason.NARROW_MARGIN
         }
         if (entropy > calibration.entropyThreshold) {
-            return Calibration.RejectionReason.HIGH_ENTROPY
+            return RejectionReason.HIGH_ENTROPY
         }
-        return Calibration.RejectionReason.NONE
+        return RejectionReason.NONE
     }
 
     /**
@@ -173,6 +177,7 @@ class CandidateRanker(
         packId: String,
         packVersion: Int,
         inferenceMillis: Long,
+        reason: RejectionReason,
     ): Identification {
         val genusMap = genusOfClass
         if (genusMap != null) {
@@ -210,6 +215,7 @@ class CandidateRanker(
                         coarseFallback = coarse,
                         normalizedEntropy = entropy,
                         margin = margin,
+                        rejectionReason = reason,
                         geoApplied = geoApplied,
                         packId = packId,
                         packVersion = packVersion,
@@ -221,6 +227,7 @@ class CandidateRanker(
         return Identification.unknown(
             alternatives = candidates.take(topK),
             normalizedEntropy = entropy,
+            rejectionReason = reason,
             packId = packId,
             packVersion = packVersion,
             inferenceMillis = inferenceMillis,

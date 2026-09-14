@@ -90,6 +90,44 @@ class EngineEndToEndTest {
         assertThat((result as PackVerifier.Result.Rejected).reason).contains("sha256")
     }
 
+    @Test
+    fun `a database with a gapped class index is refused, not silently mis-mapped`(
+        @TempDir tmp: File,
+    ) {
+        // Extract for real - PackVerifier's hash check has nothing to say
+        // about this; the payload is internally self-consistent with its own
+        // manifest, and only wrong in a way SHA-256 cannot see: the *meaning*
+        // of the data, not its integrity. So corrupt it after verification,
+        // the same place a bug in the pack *builder* (not an attacker) would
+        // produce this - and confirm IdentificationEngine.open catches it
+        // where PackVerifier structurally cannot.
+        val bytes = javaClass.getResourceAsStream("/fixtures/pack/fixture_v1.fwpack")!!
+            .readBytes()
+        val archive = File(tmp, "fixture_v1.fwpack").apply { writeBytes(bytes) }
+        val extracted = File(tmp, "installed")
+        val pack = (PackVerifier.verifyAndExtract(archive, extracted)
+            as PackVerifier.Result.Ok).pack
+
+        java.sql.DriverManager
+            .getConnection("jdbc:sqlite:${pack.databaseFile.absolutePath}").use { c ->
+                c.createStatement().use { st ->
+                    // Fixture has classes 0,1,2,3. Move index 3 to 7: same
+                    // row count, min still 0, but a gap at 3-6 and a class
+                    // beyond the range the manifest declares (numClasses=4).
+                    st.executeUpdate("UPDATE model_classes SET class_index = 7 WHERE class_index = 3")
+                }
+            }
+
+        val ex = org.junit.jupiter.api.assertThrows<IllegalArgumentException> {
+            IdentificationEngine.open(
+                pack = pack,
+                driverFactory = { path -> JdbcSqliteDriver(path) },
+                language = "en",
+            )
+        }
+        assertThat(ex.message).contains("densely indexed")
+    }
+
     // ------------------------------------------------------- identification
 
     @Test

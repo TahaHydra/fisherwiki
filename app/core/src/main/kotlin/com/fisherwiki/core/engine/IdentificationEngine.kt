@@ -50,39 +50,66 @@ class IdentificationEngine private constructor(
             val classifier = OnnxClassifier.open(
                 pack.modelFile, spec, threads = threads, useNnapi = useNnapi
             )
-            val repository = SpeciesRepository(
-                driverFactory(pack.databaseFile.absolutePath), language
-            )
+            // Everything from here on can throw (consistency checks below,
+            // GeoPrior, taxon resolution), and unlike the happy path - where
+            // the returned IdentificationEngine owns classifier/repository and
+            // callers close() it - nothing else will ever close *these*
+            // instances if we throw out of this function. Close on any
+            // failure so a pack that fails a late check does not leak an ONNX
+            // session or a SQLite connection; the latter is what a JUnit
+            // @TempDir failing to clean up on Windows was actually reporting.
+            try {
+                val repository = SpeciesRepository(
+                    driverFactory(pack.databaseFile.absolutePath), language
+                )
+                try {
+                    val (classCount, minIndex, maxIndex) = repository.classIndexDensity()
+                    require(classCount == spec.numClasses) {
+                        "pack is internally inconsistent: manifest declares " +
+                            "${spec.numClasses} classes but the database has $classCount"
+                    }
+                    // Count alone does not prove density: a table with indices
+                    // 0, 1, ..., N-2, 5000 has exactly N rows too, and every
+                    // class beyond the gap would silently resolve to the wrong
+                    // taxon. See SpeciesRepository.classIndexDensity for why
+                    // this check exists.
+                    require(classCount == 0 || (minIndex == 0 && maxIndex == classCount - 1)) {
+                        "pack is internally inconsistent: $classCount model classes are " +
+                            "not densely indexed from 0 (min=$minIndex, max=$maxIndex) - a " +
+                            "gap would silently shift the meaning of every class index after it"
+                    }
 
-            val classCount = repository.classCount()
-            require(classCount == spec.numClasses) {
-                "pack is internally inconsistent: manifest declares " +
-                    "${spec.numClasses} classes but the database has $classCount"
-            }
+                    val geo = pack.geoPriorFile?.let { f ->
+                        runCatching { GeoPrior.read(f, spec.numClasses) }.getOrElse {
+                            // A corrupt prior must degrade to purely visual ranking,
+                            // never to a crash or to silently wrong geography.
+                            GeoPrior.neutral(spec.numClasses)
+                        }
+                    } ?: GeoPrior.neutral(spec.numClasses)
 
-            val geo = pack.geoPriorFile?.let { f ->
-                runCatching { GeoPrior.read(f, spec.numClasses) }.getOrElse {
-                    // A corrupt prior must degrade to purely visual ranking,
-                    // never to a crash or to silently wrong geography.
-                    GeoPrior.neutral(spec.numClasses)
+                    val (genusOfClass, genusNames) = repository.genusIndexByClass()
+
+                    // Resolve every class's taxon once, up front. ~2,000 rows is
+                    // a few hundred KB and it takes a database round-trip off
+                    // the path between shutter press and result.
+                    val taxa = repository.taxaForClasses((0 until spec.numClasses).toList())
+
+                    val ranker = CandidateRanker(
+                        calibration = spec.calibration,
+                        geoPrior = geo,
+                        taxonResolver = { idx -> taxa[idx] },
+                        genusOfClass = genusOfClass,
+                        genusName = { g -> genusNames.getOrNull(g) },
+                    )
+                    return IdentificationEngine(pack, classifier, repository, ranker)
+                } catch (t: Throwable) {
+                    runCatching { repository.close() }
+                    throw t
                 }
-            } ?: GeoPrior.neutral(spec.numClasses)
-
-            val (genusOfClass, genusNames) = repository.genusIndexByClass()
-
-            // Resolve every class's taxon once, up front. ~2,000 rows is a few
-            // hundred KB and it takes a database round-trip off the path
-            // between shutter press and result.
-            val taxa = repository.taxaForClasses((0 until spec.numClasses).toList())
-
-            val ranker = CandidateRanker(
-                calibration = spec.calibration,
-                geoPrior = geo,
-                taxonResolver = { idx -> taxa[idx] },
-                genusOfClass = genusOfClass,
-                genusName = { g -> genusNames.getOrNull(g) },
-            )
-            return IdentificationEngine(pack, classifier, repository, ranker)
+            } catch (t: Throwable) {
+                runCatching { classifier.close() }
+                throw t
+            }
         }
     }
 

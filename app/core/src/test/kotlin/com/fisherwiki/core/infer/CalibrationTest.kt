@@ -1,5 +1,6 @@
 package com.fisherwiki.core.infer
 
+import com.fisherwiki.core.model.RejectionReason
 import com.fisherwiki.core.pack.CalibrationSpec
 import com.google.common.truth.Truth.assertThat
 import kotlin.math.abs
@@ -132,7 +133,7 @@ class CalibrationTest {
     @Test
     fun `confident well separated prediction is accepted`() {
         val dist = Calibration.calibrate(floatArrayOf(8f, 1f, 0.5f, 0f), spec)
-        assertThat(Calibration.reject(dist, spec)).isEqualTo(Calibration.RejectionReason.NONE)
+        assertThat(Calibration.reject(dist, spec)).isEqualTo(RejectionReason.NONE)
     }
 
     @Test
@@ -141,7 +142,7 @@ class CalibrationTest {
         val dist = Calibration.calibrate(FloatArray(20) { if (it == 0) 1.2f else 1f }, spec)
         assertThat(dist.bestProbability).isLessThan(spec.unknownThreshold)
         assertThat(Calibration.reject(dist, spec))
-            .isEqualTo(Calibration.RejectionReason.LOW_CONFIDENCE)
+            .isEqualTo(RejectionReason.LOW_CONFIDENCE)
     }
 
     @Test
@@ -151,7 +152,7 @@ class CalibrationTest {
         val dist = Calibration.calibrate(floatArrayOf(5.0f, 4.98f, -3f, -4f), spec)
         assertThat(dist.bestProbability).isGreaterThan(spec.unknownThreshold)
         assertThat(Calibration.reject(dist, spec))
-            .isEqualTo(Calibration.RejectionReason.NARROW_MARGIN)
+            .isEqualTo(RejectionReason.NARROW_MARGIN)
     }
 
     @Test
@@ -160,14 +161,14 @@ class CalibrationTest {
         val dist = Calibration.calibrate(floatArrayOf(4f, 0f, 0f, 0f), strict)
         assertThat(dist.best).isEqualTo(0)
         assertThat(Calibration.reject(dist, strict))
-            .isEqualTo(Calibration.RejectionReason.BELOW_CLASS_THRESHOLD)
+            .isEqualTo(RejectionReason.BELOW_CLASS_THRESHOLD)
     }
 
     @Test
     fun `per class threshold does not affect other classes`() {
         val strict = spec.copy(perClassThreshold = mapOf("3" to 0.99f))
         val dist = Calibration.calibrate(floatArrayOf(6f, 0f, 0f, 0f), strict)
-        assertThat(Calibration.reject(dist, strict)).isEqualTo(Calibration.RejectionReason.NONE)
+        assertThat(Calibration.reject(dist, strict)).isEqualTo(RejectionReason.NONE)
     }
 
     // --------------------------------------------------- temperature fitting

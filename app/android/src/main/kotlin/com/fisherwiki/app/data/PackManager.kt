@@ -10,10 +10,14 @@ import java.io.File
 /**
  * Installs, verifies, lists and removes offline packs.
  *
- * Installation is **atomic**: a pack is verified and extracted into a staging
- * directory, and only a fully-verified result is moved into place. A failed or
- * interrupted install can therefore never leave a half-extracted pack that the
- * engine would later load and trust.
+ * Installation is **atomic with respect to the pack being installed**: it is
+ * verified and extracted into a staging directory, hash-checked again from its
+ * final on-disk location (not just the staging copy - see [install]), and only
+ * then swapped into place with a same-filesystem rename rather than a
+ * delete-then-write. A failed or interrupted install can therefore never leave
+ * a half-extracted or silently-corrupted pack that the engine would later load
+ * and trust, and never destroys a working previous version before the new one
+ * is confirmed good.
  *
  * Packs live in the app's private files directory, so no other app can modify a
  * verified pack behind our back and nothing needs storage permissions.
@@ -36,8 +40,29 @@ class PackManager(private val context: Context) {
     /** Directory for an installed pack version. */
     private fun dirFor(packId: String, version: Int) = File(root, "$packId-v$version")
 
+    /**
+     * True for a real installed-pack directory name (`packId-vN`), false for
+     * the transient `.new-`/`.trash-` names [install] uses while swapping one
+     * in. Those are implementation detail, not a pack, and must never be
+     * listed, matched against by [removeAll], or reported as a broken pack.
+     */
+    private fun isPackDirName(name: String) = INSTALL_TEMP_MARKER !in name
+
     fun installedDirs(): List<File> =
-        root.listFiles { f -> f.isDirectory }?.sortedBy { it.name } ?: emptyList()
+        root.listFiles { f -> f.isDirectory && isPackDirName(f.name) }
+            ?.sortedBy { it.name } ?: emptyList()
+
+    /** Delete any `.new-`/`.trash-` directory left behind by an install that
+     * was interrupted (process killed, device powered off) before it could
+     * clean up after itself. Never touches a real `packId-vN` directory. Safe
+     * to call any time: these are always either fully-verified-but-not-yet-
+     * needed (trash, about to be deleted anyway) or partially-written
+     * (new, never linked to by a real pack name), so there is nothing
+     * referencing them that this could break. */
+    private fun sweepOrphanedInstallTemp() {
+        root.listFiles { f -> f.isDirectory && !isPackDirName(f.name) }
+            ?.forEach { it.deleteRecursively() }
+    }
 
     /**
      * List installed packs, skipping any whose manifest no longer parses.
@@ -79,6 +104,7 @@ class PackManager(private val context: Context) {
      */
     fun install(archive: File, deleteSource: Boolean = false): Result {
         if (!archive.isFile) return Result.Rejected("file not found")
+        sweepOrphanedInstallTemp()
         staging.deleteRecursively()
         staging.mkdirs()
         val stageDir = File(staging, "pending").apply { mkdirs() }
@@ -93,6 +119,7 @@ class PackManager(private val context: Context) {
 
         val manifest = verified.manifest
         val target = dirFor(manifest.packId, manifest.packVersion)
+        target.parentFile?.mkdirs()
 
         // Note which older versions exist so the caller can report an upgrade.
         val replaced = installedDirs()
@@ -100,28 +127,67 @@ class PackManager(private val context: Context) {
             .mapNotNull { it.name.substringAfterLast("-v").toIntOrNull() }
             .maxOrNull()
 
-        if (target.exists()) target.deleteRecursively()
-        target.parentFile?.mkdirs()
-
-        // Atomic swap. If the rename fails (different filesystem), fall back to
-        // a copy, then verify again from the final location rather than
-        // trusting that the copy was faithful.
-        val moved = stageDir.renameTo(target)
+        // Move (or, cross-filesystem, copy) into a *new*, never-before-used
+        // directory under `root` - never write over `target` directly. This
+        // is what makes the eventual swap below a same-filesystem rename
+        // rather than a delete-then-write: everything up to this point can
+        // fail or be interrupted without touching an existing installed pack.
+        val newDir = File(root, "${manifest.packId}-v${manifest.packVersion}" +
+            "${INSTALL_TEMP_MARKER}new-${System.nanoTime()}")
+        val moved = stageDir.renameTo(newDir)
         if (!moved) {
-            stageDir.copyRecursively(target, overwrite = true)
+            stageDir.copyRecursively(newDir, overwrite = true)
         }
         staging.deleteRecursively()
 
-        val finalFiles = manifest.entries.associate { it.path to File(target, it.path) }
+        // Re-verify from the *final* location, hashes included - not just
+        // size, and not just the staging copy `PackVerifier` already checked.
+        // `PackVerifier.verifyAndExtract` proved the staged bytes matched the
+        // manifest; it did not prove the subsequent move or copy was
+        // faithful, and a cross-filesystem copy is exactly the case that
+        // needs re-checking rather than trusting.
+        val newFiles = manifest.entries.associate { it.path to File(newDir, it.path) }
         for (spec in manifest.entries) {
-            val f = finalFiles.getValue(spec.path)
+            val f = newFiles.getValue(spec.path)
             if (!f.isFile || f.length() != spec.bytes) {
-                target.deleteRecursively()
-                return Result.Rejected("install verification failed for ${spec.path}")
+                newDir.deleteRecursively()
+                return Result.Rejected("install verification failed for ${spec.path}: size mismatch")
+            }
+            val actual = com.fisherwiki.core.pack.SafeZip.sha256(f)
+            if (!actual.equals(spec.sha256, ignoreCase = true)) {
+                newDir.deleteRecursively()
+                return Result.Rejected(
+                    "install verification failed for ${spec.path}: checksum mismatch"
+                )
             }
         }
 
+        // Swap: move the old pack (if any) aside before moving the new one
+        // in, rather than deleting the old one first. Both are same-
+        // filesystem renames of a directory already under `root`, so each
+        // completes or does not - there is no copy, and no window where a
+        // partially-written directory sits at `target`. If the process is
+        // killed between the two renames, `target` may briefly not exist,
+        // but the fully-verified old pack survives under its trash name and
+        // is *not* lost: `sweepOrphanedInstallTemp` only deletes it on a
+        // later call, after a real pack (old or new) is already in place.
+        val trash = if (target.exists()) {
+            File(root, "${target.name}${INSTALL_TEMP_MARKER}trash-${System.nanoTime()}")
+                .also { if (!target.renameTo(it)) {
+                    newDir.deleteRecursively()
+                    return Result.Rejected("could not move the previous pack version aside")
+                } }
+        } else null
+
+        if (!newDir.renameTo(target)) {
+            trash?.renameTo(target) // best-effort restore of the working pack
+            newDir.deleteRecursively()
+            return Result.Rejected("could not finalise pack installation")
+        }
+        trash?.deleteRecursively()
+
         if (deleteSource) archive.delete()
+        val finalFiles = manifest.entries.associate { it.path to File(target, it.path) }
         return Result.Installed(InstalledPack(manifest, target, finalFiles), replaced)
     }
 
@@ -195,5 +261,11 @@ class PackManager(private val context: Context) {
 
     companion object {
         const val MAX_PACK_BYTES = 1_500_000_000L
+
+        /** Substring that marks a directory under [root] as install-temporary
+         * rather than an installed pack. No real pack id can ever produce a
+         * matching directory name, because [PackVerifier.validateManifest]
+         * constrains `pack_id` to `^[a-z0-9_]{1,64}$`, which excludes `.`. */
+        internal const val INSTALL_TEMP_MARKER = ".instmp-"
     }
 }

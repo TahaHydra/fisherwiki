@@ -4,6 +4,7 @@ import com.fisherwiki.core.model.Candidate
 import com.fisherwiki.core.model.Certainty
 import com.fisherwiki.core.model.Identification
 import com.fisherwiki.core.model.Rank
+import com.fisherwiki.core.model.RejectionReason
 import com.fisherwiki.core.model.Taxon
 import com.fisherwiki.core.pack.CalibrationSpec
 import com.google.common.truth.Truth.assertThat
@@ -45,6 +46,7 @@ class ReportTest {
             alternatives = emptyList(),
             margin = 0.9f,
             normalizedEntropy = 0.05f,
+            rejectionReason = RejectionReason.NONE,
         )
         val text = Report.explain(id, CalibrationSpec())
         assertClean(text)
@@ -60,6 +62,7 @@ class ReportTest {
             alternatives = listOf(candidate(runnerUp, 0.55f, classIndex = 1)),
             margin = 0.05f,
             normalizedEntropy = 0.4f,
+            rejectionReason = RejectionReason.NONE,
         )
         val text = Report.explain(id, cal)
         assertClean(text)
@@ -76,6 +79,7 @@ class ReportTest {
             alternatives = listOf(candidate(species, 0.20f)),
             margin = 0.5f,
             normalizedEntropy = 0.3f,
+            rejectionReason = RejectionReason.LOW_CONFIDENCE,
         )
         val text = Report.explain(id, cal)
         assertClean(text)
@@ -94,6 +98,7 @@ class ReportTest {
             alternatives = listOf(candidate(species, 0.5f), candidate(runnerUp, 0.48f, classIndex = 1)),
             margin = 0.02f,
             normalizedEntropy = 0.3f,
+            rejectionReason = RejectionReason.NARROW_MARGIN,
         )
         val text = Report.explain(id, cal)
         assertClean(text)
@@ -111,6 +116,7 @@ class ReportTest {
             alternatives = listOf(candidate(species, 0.3f)),
             margin = 0.2f,
             normalizedEntropy = 0.95f,
+            rejectionReason = RejectionReason.HIGH_ENTROPY,
         )
         val text = Report.explain(id, cal)
         assertClean(text)
@@ -131,6 +137,7 @@ class ReportTest {
             alternatives = listOf(candidate(species, 0.5f, classIndex = 0)),
             margin = 0.3f,
             normalizedEntropy = 0.2f,
+            rejectionReason = RejectionReason.BELOW_CLASS_THRESHOLD,
         )
         val text = Report.explain(id, cal)
         assertClean(text)
@@ -148,6 +155,7 @@ class ReportTest {
             coarseFallback = candidate(genus, 0.7f, classIndex = -1),
             margin = 0.3f,
             normalizedEntropy = 0.4f,
+            rejectionReason = RejectionReason.LOW_CONFIDENCE,
         )
         val text = Report.explain(id, cal)
         assertClean(text)

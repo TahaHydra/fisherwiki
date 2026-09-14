@@ -547,6 +547,26 @@ class SpeciesRepository(
     fun classCount(): Int =
         driver.queryOne("SELECT count(*) FROM model_classes") { it.getInt(0) ?: 0 } ?: 0
 
+    /**
+     * `(count, min(class_index), max(class_index))` in one query, so the
+     * caller can confirm class indices are dense from 0 - not merely that
+     * there are the right *number* of rows.
+     *
+     * That distinction matters: a `model_classes` table with indices
+     * `0, 1, 2, ..., 1976, 5000` has exactly as many rows as a dense one, so
+     * a count-only check (`repository.classCount() == spec.numClasses`,
+     * `IdentificationEngine.open`'s check before this existed) would accept
+     * it - and then every class beyond the gap resolves to the wrong taxon,
+     * silently, which is exactly the failure `docs/SECURITY.md` §2.2 already
+     * documented as required to prevent, without the engine actually doing
+     * so at load time.
+     */
+    fun classIndexDensity(): Triple<Int, Int?, Int?> =
+        driver.queryOne(
+            "SELECT count(*), min(class_index), max(class_index) FROM model_classes"
+        ) { r -> Triple(r.getInt(0) ?: 0, r.getInt(1), r.getInt(2)) }
+            ?: Triple(0, null, null)
+
     /** Class index -> genus key, for the ranker's coarse fallback. */
     fun genusIndexByClass(): Pair<IntArray, Array<String>> {
         val rows = driver.query(

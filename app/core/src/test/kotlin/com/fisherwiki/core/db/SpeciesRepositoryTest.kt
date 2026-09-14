@@ -510,6 +510,65 @@ class SpeciesRepositoryTest {
     }
 
     @Test
+    fun `classIndexDensity reports a dense range for the real fixture`() {
+        // The main fixture's model_classes is 0,1,2,3 - exactly what
+        // IdentificationEngine.open requires. Pinning the healthy case here,
+        // next to the gapped one below, so a change to either fixture or
+        // query shows up as a specific, attributable failure.
+        repo().use { r -> assertThat(r.classIndexDensity()).isEqualTo(Triple(4, 0, 3)) }
+    }
+
+    @Test
+    fun `classIndexDensity reports a gap, not just a matching count`(@TempDir tmp: File) {
+        // 4 rows, same as the healthy fixture - but indices 0,1,2,5, not
+        // 0,1,2,3. A count-only check (classCount() == numClasses) cannot
+        // tell these apart; this is exactly the case IdentificationEngine.open
+        // must reject rather than silently mis-map class index 3 onto
+        // whatever taxon actually owns index 5.
+        val gappedDbPath = File(tmp, "gapped.sqlite").absolutePath
+        val schema = javaClass.getResourceAsStream("/schema/species_schema.sql")
+            ?.bufferedReader()?.readText()
+            ?: error("species_schema.sql missing from test resources")
+        DriverManager.getConnection("jdbc:sqlite:$gappedDbPath").use { c ->
+            c.createStatement().use { st ->
+                val ddl = schema.lineSequence()
+                    .map { line -> line.substringBefore("--").trimEnd() }
+                    .filter { it.isNotBlank() }
+                    .joinToString("\n")
+                for (stmt in ddl.split(";")) {
+                    val s = stmt.trim()
+                    if (s.isNotEmpty()) st.execute(s)
+                }
+            }
+            c.createStatement().use { st ->
+                st.executeUpdate(
+                    "INSERT INTO sources VALUES ('gbif','GBIF','GBIF',NULL," +
+                        "'CC-BY-4.0',NULL,'2026-09-13','GBIF.',NULL)"
+                )
+                st.executeUpdate(
+                    """
+                    INSERT INTO taxa (fw_taxon_id, scientific_name, rank, source_id) VALUES
+                      (1,'Aus aus','species','gbif'), (2,'Bus bus','species','gbif'),
+                      (3,'Cus cus','species','gbif'), (4,'Dus dus','species','gbif')
+                    """
+                )
+                st.executeUpdate(
+                    """
+                    INSERT INTO model_classes VALUES
+                      (0,1,10,5,NULL,NULL,NULL), (1,2,10,5,NULL,NULL,NULL),
+                      (2,3,10,5,NULL,NULL,NULL), (5,4,10,5,NULL,NULL,NULL)
+                    """
+                )
+            }
+        }
+
+        JdbcSqliteDriver(gappedDbPath).use { driver ->
+            val repository = SpeciesRepository(driver, "en")
+            assertThat(repository.classIndexDensity()).isEqualTo(Triple(4, 0, 5))
+        }
+    }
+
+    @Test
     fun `sources are listed with licence information`() {
         repo().use { r ->
             val s = r.allSources()

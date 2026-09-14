@@ -77,6 +77,34 @@ enum class Certainty {
 }
 
 /**
+ * *Why* a species-level claim was or was not made - the specific signal that
+ * decided [Certainty], not just the category it landed in.
+ *
+ * This is a domain fact about the result, not an implementation detail of
+ * [com.fisherwiki.core.infer.Calibration]'s algorithm, which is why it lives
+ * here rather than as a nested type on that class: "the model is confident it
+ * is one of two similar species" is something a user or a diagnostic tool is
+ * entitled to be told, on-device, from the one place that actually knows it -
+ * not reconstructed downstream from a handful of exported numbers by a second
+ * piece of code that has to re-derive the same decision.
+ */
+enum class RejectionReason {
+    /** No rejection; the species claim stands. */
+    NONE,
+    LOW_CONFIDENCE,
+    NARROW_MARGIN,
+    HIGH_ENTROPY,
+    BELOW_CLASS_THRESHOLD,
+    /**
+     * Every candidate the model proposed failed to resolve to a taxon in this
+     * pack's species database - a pack-consistency problem, not a confidence
+     * one. Distinct from the others because no amount of retraining or
+     * recalibration fixes it; only a correct pack does.
+     */
+    NO_CANDIDATE,
+}
+
+/**
  * The outcome of identifying one or more photographs.
  *
  * [best] is deliberately nullable. When [certainty] is [Certainty.UNKNOWN]
@@ -95,6 +123,14 @@ data class Identification(
     val normalizedEntropy: Float = 1f,
     /** Margin between top-1 and top-2 calibrated probabilities. */
     val margin: Float = 0f,
+    /**
+     * The specific signal that produced [certainty]. [RejectionReason.NONE]
+     * for [Certainty.CONFIDENT] and [Certainty.AMBIGUOUS]; one of the others
+     * for [Certainty.COARSE_ONLY] and [Certainty.UNKNOWN], recording why the
+     * *species*-level claim was rejected even when a coarser one was still
+     * offered.
+     */
+    val rejectionReason: RejectionReason = RejectionReason.NONE,
     /** Number of photographs fused into this result. */
     val photoCount: Int = 1,
     /** Whether a geographic prior was applied. */
@@ -121,6 +157,7 @@ data class Identification(
             packId: String = "",
             packVersion: Int = 0,
             inferenceMillis: Long = 0,
+            rejectionReason: RejectionReason = RejectionReason.NO_CANDIDATE,
         ) = Identification(
             certainty = Certainty.UNKNOWN,
             best = null,
@@ -130,6 +167,7 @@ data class Identification(
             packId = packId,
             packVersion = packVersion,
             inferenceMillis = inferenceMillis,
+            rejectionReason = rejectionReason,
         )
     }
 }

@@ -130,15 +130,7 @@ class IdentifyViewModel(app: Application) : AndroidViewModel(app) {
     ) {
         viewModelScope.launch(Dispatchers.IO) {
             val dir = File(appCtx.filesDir, "catches").apply { mkdirs() }
-            val stored = sourceUris.mapIndexedNotNull { i, s ->
-                runCatching {
-                    val out = File(dir, "${System.currentTimeMillis()}_$i.jpg")
-                    appCtx.contentResolver.openInputStream(Uri.parse(s))?.use { input ->
-                        out.outputStream().use { input.copyTo(it) }
-                    }
-                    out.absolutePath
-                }.getOrNull()
-            }
+            val stored = sourceUris.mapIndexedNotNull { i, s -> copyIntoCatchStorage(dir, s, i) }
             val record = CatchLog.from(
                 identification, stored,
                 latitude.takeIf { appCtx.settings.storeLocationWithCatches },
@@ -147,6 +139,42 @@ class IdentifyViewModel(app: Application) : AndroidViewModel(app) {
             val id = appCtx.catchLog.insert(record)
             withContext(Dispatchers.Main) { onSaved(id) }
         }
+    }
+
+    /**
+     * Copy one source image into app-private storage, honestly.
+     *
+     * Two bugs this fixes:
+     *
+     * 1. `openInputStream(uri)?.use { ... }` returning null (the URI's
+     *    permission was revoked, the provider is gone, whatever the reason)
+     *    used to fall through to returning `out.absolutePath` anyway - the
+     *    `.use` block simply never ran, `out` was never created, and the
+     *    catch log ended up pointing at a file that was never written.
+     * 2. Every file was named `*.jpg` regardless of what was actually picked.
+     *    A PNG or WebP image copied byte-for-byte under a `.jpg` name is
+     *    still PNG/WebP bytes; anything that opens the file by its extension
+     *    (including, eventually, a future export or share feature) would get
+     *    it wrong. The real MIME type from the content resolver picks the
+     *    honest extension, with `.jpg` only as a genuine last resort when the
+     *    provider does not say.
+     */
+    private fun copyIntoCatchStorage(dir: File, sourceUri: String, index: Int): String? {
+        val uri = Uri.parse(sourceUri)
+        val mime = appCtx.contentResolver.getType(uri)
+        val extension = EXTENSION_BY_MIME[mime] ?: "jpg"
+        val out = File(dir, "${System.currentTimeMillis()}_$index.$extension")
+        val wrote = runCatching {
+            appCtx.contentResolver.openInputStream(uri)?.use { input ->
+                out.outputStream().use { input.copyTo(it) }
+                true
+            } ?: false
+        }.getOrDefault(false)
+        if (!wrote || out.length() == 0L) {
+            out.delete() // no partial or phantom file left in the catch log's photo directory
+            return null
+        }
+        return out.absolutePath
     }
 
     /** Record a user correction against a saved catch. */
@@ -158,4 +186,19 @@ class IdentifyViewModel(app: Application) : AndroidViewModel(app) {
 
     fun searchSpecies(query: String) =
         appCtx.engine()?.search(query, limit = 40).orEmpty()
+
+    private companion object {
+        /** Every format the gallery picker and camera can realistically hand
+         * back (`ActivityResultContracts.PickVisualMedia.ImageOnly`). Not
+         * exhaustive by design: an unrecognised type falls back to `.jpg`
+         * in [copyIntoCatchStorage] rather than growing this table forever. */
+        val EXTENSION_BY_MIME = mapOf(
+            "image/jpeg" to "jpg",
+            "image/png" to "png",
+            "image/webp" to "webp",
+            "image/heic" to "heic",
+            "image/heif" to "heif",
+            "image/gif" to "gif",
+        )
+    }
 }
