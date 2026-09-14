@@ -91,6 +91,20 @@ def build(
     of each taxon, not only the images we downloaded. The training corpus is
     capped at 300 images per species and skewed by our own sampling, which would
     make the prior describe our sampling rather than the species' range.
+
+    That default did not always do what its own docstring claimed. The query
+    joined ``corpus_members USING (candidate_id)`` - restricted, by
+    construction, to exactly the candidates selected into the training corpus,
+    which is precisely the sampling this function says it exists to escape.
+    ``candidates`` holds every fish observation *discovered* during the bulk
+    scan, independent of whether it was ever downloaded (`discovered_at` is
+    set at discovery; `stored`, which ``corpus_members`` is built from, only
+    gets a row once bytes are actually fetched). The fix below still uses
+    ``corpus_members`` for the one thing only it knows - which taxon maps to
+    which ``class_id`` in *this* corpus build - and then joins the geography
+    from ``candidates`` by ``taxon_id``, not ``candidate_id``, so a species
+    with 40 downloaded training images but 4,000 discovered observations gets
+    a range built from all 4,000.
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -101,19 +115,26 @@ def build(
     log(f"geo prior: {num_classes} classes at {cell_degrees} degree cells")
 
     if use_all_observations:
-        # Join the full candidate table (every licensed photo we know of, not
-        # just the ones we fetched) so the range is as complete as the data
-        # allows. Coordinates come from the observation, so we count distinct
-        # observations rather than photos.
+        # class_id -> taxon_id for this corpus build only (class_id numbering
+        # is corpus-specific), then every discovered candidate of that taxon -
+        # not gated by corpus_members membership, which is the whole point.
+        # quality_grade='research' is not a loosening of the docstring's
+        # promise: every fish candidate with a taxon_id and coordinates in
+        # this store already carries that grade, so the filter is here to
+        # keep that true by construction rather than by coincidence of what
+        # happened to be fetched.
         rows = con.execute(
             f"""
             SELECT m.class_id,
                    c.latitude, c.longitude,
                    count(DISTINCT c.group_key) AS n
-            FROM corpus_members m
-            JOIN candidates c USING (candidate_id)
-            WHERE m.corpus = '{corpus}'
-              AND c.latitude IS NOT NULL AND c.longitude IS NOT NULL
+            FROM (
+                SELECT DISTINCT class_id, taxon_id FROM corpus_members
+                WHERE corpus = '{corpus}'
+            ) m
+            JOIN candidates c ON c.taxon_id = m.taxon_id
+            WHERE c.latitude IS NOT NULL AND c.longitude IS NOT NULL
+              AND c.quality_grade = 'research'
             GROUP BY m.class_id, c.latitude, c.longitude
             """
         ).fetchall()
