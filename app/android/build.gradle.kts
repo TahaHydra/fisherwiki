@@ -83,7 +83,18 @@ android {
     }
 
     lint {
-        abortOnError = false
+        // A real lint *error* blocks CI. Currently 0, so this costs nothing
+        // today and catches the next one instead of it riding along silently
+        // - which `false` here was doing, on a release-gate CI job whose
+        // whole point is to not let that happen.
+        abortOnError = true
+        // NOT yet true: 12 existing warnings (8x UseKtx, ObsoleteSdkInt,
+        // MonochromeLauncherIcon, SelectedPhotoAccess) are real but cosmetic,
+        // not part of what this audit pass fixed, and flipping this now would
+        // make CI's first run fail on pre-existing style debt rather than on
+        // anything this change touched. Tracked in task.md; flip this once
+        // they are cleared; do not silently let new warnings join them
+        // between now and then.
         warningsAsErrors = false
     }
 }

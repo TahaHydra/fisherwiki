@@ -1,0 +1,172 @@
+# CI for FisherWiki.
+#
+# Before this file existed, the whole test suite - Python, the torch-
+# dependent tests, three Kotlin modules, Robolectric, an APK permission
+# checker built specifically to catch a real leaked permission, and a
+# documentation-link checker that has already found two real gaps -
+# depended on someone remembering to run it locally. This runs all of it on
+# every push and pull request against main, and fails the run if any of it
+# regresses.
+#
+# Scope: everything that does not need real hardware. It does not train a
+# model (hours, needs a GPU this runner does not have) and does not run on
+# an Android device or emulator (none is available anywhere in this
+# project's history - see README.md's own stated limitation). Both remain
+# manual. Everything that *can* run in a stock GitHub-hosted runner does.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A second push before the first finished cancels the first - a stale run
+# against an already-superseded commit is pure waste.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --- data / provenance / licensing pipeline (tools/, no torch needed) ---
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Test
+        run: python -m pytest tests/ -q
+
+  # --- training/eval pipeline (ml/, needs torch) ---
+  #
+  # requirements-train.txt deliberately omits torch itself - it is hardware-
+  # specific (see the file's own comment: ROCm on Windows, CUDA, or CPU). CI
+  # has no GPU, so this installs the plain CPU wheel from PyPI, which is
+  # exactly the "CPU" case that comment already documents. These are unit
+  # tests of the training code's *correctness* (augmentation actually varies
+  # by epoch, evaluation alignment survives dropped batches, ...), not a
+  # training run - they finish in seconds on CPU.
+  python-train:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install (CPU torch)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements-train.txt
+          pip install pytest
+
+      - name: Test
+        run: python -m pytest tests/ -q
+
+  # --- :core and :cli (pure JVM, real ONNX Runtime, real fixture packs) ---
+  kotlin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Temurin specifically: docs/engineering-log.md records ONNX Runtime's
+      # native library failing to load under the JetBrains Runtime bundled
+      # with Android Studio on Windows. GitHub's runners do not carry a JBR
+      # at all, so this is not the same failure mode, but pinning the exact
+      # distribution validated to load onnxruntime correctly costs nothing
+      # and removes the question if it is ever run somewhere that does.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          build-root-directory: app
+
+      - name: core + cli tests
+        working-directory: app
+        run: ./gradlew :core:test :cli:test --console=plain
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kotlin-test-reports
+          path: |
+            app/core/build/reports/tests
+            app/cli/build/reports/tests
+          retention-days: 7
+
+  # --- :android (Robolectric unit tests, lint, build, real-APK checks) ---
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          build-root-directory: app
+
+      - name: Unit tests (Robolectric)
+        working-directory: app
+        run: ./gradlew :android:testDebugUnitTest --console=plain
+
+      - name: Lint
+        working-directory: app
+        run: ./gradlew :android:lintDebug --console=plain
+
+      - name: Assemble debug APK
+        working-directory: app
+        run: ./gradlew :android:assembleDebug --console=plain
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Verify permissions against the *built* APK, not the source manifest
+        # This is not a restatement of the manifest: onnxruntime-android
+        # injected INTERNET into the shipped artefact while the source
+        # manifest requested neither INTERNET nor it - see
+        # docs/engineering-log.md. Reading the APK's own binary manifest is
+        # the only check that would have caught that, which is the entire
+        # reason this script parses AXML by hand instead of trusting
+        # `AndroidManifest.xml`.
+        run: python scripts/check_apk_permissions.py
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-test-reports
+          path: app/android/build/reports
+          retention-days: 7
+
+  # --- documentation ---
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Local links and referenced-file paths resolve
+        run: python scripts/check_doc_links.py

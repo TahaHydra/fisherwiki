@@ -116,6 +116,15 @@ combined.
     val / development-test / release-test), building calibration and safety
     cross-references from val/dev-test, and reading release-test exactly once
     after everything is frozen.
+11. **Clear 12 pre-existing Android lint warnings**, then flip
+    `warningsAsErrors = true` in `app/android/build.gradle.kts` so they can't
+    silently return: 8× `UseKtx` (`String.toUri`, `SharedPreferences.edit`),
+    `ObsoleteSdkInt` (an unneeded `v26` resource qualifier — `minSdk` is
+    already 26), `MonochromeLauncherIcon`, and `SelectedPhotoAccess` (Android
+    14's partial photo-access API, worth a real look rather than a suppress —
+    `PickVisualMedia` may already cover it, needs checking). `abortOnError`
+    is already `true`; these are style/completeness, not correctness, which
+    is why they were left for this pass rather than mixed into it.
 
 ---
 
