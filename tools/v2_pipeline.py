@@ -105,6 +105,9 @@ def main(argv=None) -> int:
     ap.add_argument("--batch", default="batch1_inat_topup")
     ap.add_argument("--shards-out", default=r"D:\fisherwiki-data\v2\shards")
     ap.add_argument("--prepare-limit", type=int, default=None)
+    ap.add_argument("--detect-batch", type=int, default=16)
+    ap.add_argument("--detect-workers", type=int, default=4,
+                    help="measured fastest end to end; more thrash the HDD")
     args = ap.parse_args(argv)
 
     WORK.mkdir(parents=True, exist_ok=True)
@@ -113,6 +116,7 @@ def main(argv=None) -> int:
         wait_for_pid(args.after_pid)
 
     wanted = [s.strip() for s in args.stages.split(",") if s.strip()]
+    detect_batch, detect_workers = args.detect_batch, args.detect_workers
 
     if "assign" in wanted:
         if not _run([PY, "tools/dataset.py", "v2-assign", "--batch", args.batch],
@@ -128,7 +132,8 @@ def main(argv=None) -> int:
     if "detect" in wanted:
         # Not fatal: preparation falls back to whole frames for anything without
         # a box, so a detector that dies partway still leaves a usable corpus.
-        _run([PY_TRAIN, "tools/detect_fish.py", "--batch", "32"], "detect", state)
+        _run([PY_TRAIN, "tools/detect_fish.py", "--batch", str(detect_batch),
+              "--decode-workers", str(detect_workers)], "detect", state)
 
     if "prepare" in wanted:
         cmd = [PY_TRAIN, "tools/prepare_shards_v2.py", "--out", args.shards_out]
