@@ -77,15 +77,15 @@ different claims.
 | Component | Status | How verified |
 |---|---|---|
 | Data acquisition + provenance | **done** | 307,415 images fetched, every one with a licence record |
-| Licence policy enforcement | **done** | 207 Python tests; store refuses inadmissible media |
+| Licence policy enforcement | **done** | 211 Python tests; store refuses inadmissible media |
 | Taxonomy reconciliation | **done** | 43,559 canonical IDs, 66,754 synonyms, verified against GBIF |
 | Corpus + leakage-safe splits | **done** | 0 group leaks, 0 hash leaks, enforced by a refusal |
 | Species database | **done** | Kotlin tests against the real shipping schema |
-| Identification engine (`:core`) | **done** | 133 Kotlin tests, incl. cross-language parity with the Python pipeline |
+| Identification engine (`:core`) | **done** | 136 Kotlin tests, incl. cross-language parity with the Python pipeline |
 | Pack format + verification | **done** | adversarial archive tests (Zip Slip, bombs, allow-list, hash mismatch) |
 | Android app | **builds** | 54.8 MB APK (arm64), compiles and packages ONNX Runtime correctly |
 | Trained model | **done** | 1,978 species, 0.5336 top-1 on a test split read once; calibrated to 0.0071 ECE |
-| Open-set rejection | **done** | 86.3% of unseen species and 97.8% of non-fish rejected |
+| Open-set rejection | **done** | 93.3% of unseen species and 97.8% of non-fish rejected |
 | Release pipeline + pack | **done** | `finalize_model.py` end-to-end; all 16 `verify_pack.py` checks pass on the built pack |
 | **On-device testing** | **not done** | no physical device or emulator available here — see below |
 
@@ -135,7 +135,7 @@ different claims.
 ```bash
 cd app
 echo "sdk.dir=C:/Users/you/AppData/Local/Android/Sdk" > local.properties
-./gradlew :core:test          # 104 tests, no Android SDK needed
+./gradlew :core:test          # 136 tests, no Android SDK needed
 ./gradlew :android:assembleDebug
 ```
 
@@ -156,7 +156,7 @@ then **Packs → Install from file**.
 ```bash
 py -m venv .venv
 .venv/Scripts/python -m pip install -r requirements.txt
-.venv/Scripts/python -m pytest tests/ -q          # 129 tests
+.venv/Scripts/python -m pytest tests/ -q          # 211 tests
 
 .venv/Scripts/python tools/dataset.py discover    # what is available, and its licence
 ```

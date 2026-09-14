@@ -3,7 +3,7 @@
 Offline-first, privacy-first fish identification for recreational anglers.
 On-device inference only. No account, no cloud, no telemetry.
 
-Last updated: 2026-09-13
+Last updated: 2026-09-14
 
 ---
 
@@ -31,7 +31,7 @@ completes.
   **zero leakage** (groups and hashes), 0 classes missing val or test
 - Curated safety warnings: 346 rows over 326 species, every one sourced
 
-### Engine (`:core`, pure JVM — 104 tests)
+### Engine (`:core`, pure JVM — 136 tests)
 - Pack format with hardened verification: Zip Slip, zip bombs, entry allow-list,
   per-file SHA-256, atomic install
 - Preprocessing with antialiased downscaling, **cross-language parity with the
@@ -41,7 +41,7 @@ completes.
 - Ranking with genus fallback; multi-photo fusion (sum rule)
 - Species repository tested against the real shipping schema
 
-### Python tooling (146 tests)
+### Python tooling (211 tests)
 - Licence policy engine that fails closed
 - Resumable downloader: range requests, token buckets, checksums
 - Provenance store where pixels cannot be written without an admissible licence
@@ -237,9 +237,15 @@ cross-reference is what closes it. See [`docs/MODEL.md`](docs/MODEL.md) §7.
 
 | negative set | n | rejected |
 |---|---|---|
-| held-out fish species (717 unseen) | 3,000 | 86.3% |
+| held-out fish species (88 unseen) | 3,000 | 93.3% |
 | non-fish, same source and conditions | 2,978 | 97.8% |
 | synthetic | 1,000 | 100.0% |
+
+The held-out set was originally scoped by excluded *candidate*, not excluded
+*species* — 717 "unseen species" were mostly trained species leaking in
+through re-uploaded duplicates. Fixing the query dropped the pool to the 88
+species genuinely never trained on and raised the measured rate accordingly.
+See [`docs/MODEL.md` §6](docs/MODEL.md).
 
 ### Shipped artefacts
 
@@ -247,7 +253,7 @@ cross-reference is what closes it. See [`docs/MODEL.md`](docs/MODEL.md) §7.
 |---|---|
 | Model | ONNX fp16, 7.5 MB, 3,993,078 params (+0.0007 top-1 vs fp32, 99.9% agreement) |
 | Pack | `global_v1-v1.fwpack`, 32.6 MB, all 16 `verify_pack.py` checks pass |
-| Tests | 207 Python (`.venv`) + 6 torch (`.venv-train`) + 133 Kotlin |
+| Tests | 211 Python (`.venv`) + 11 torch (`.venv-train`) + 198 Kotlin (136 core + 51 cli + 11 android) |
 
 ### Hardware and pipeline
 
