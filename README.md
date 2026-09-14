@@ -261,6 +261,7 @@ inference. See [`ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 | [DATA_PROVENANCE.md](docs/DATA_PROVENANCE.md) | per-image provenance and how to audit it |
 | [TRAINING.md](docs/TRAINING.md) | reproducing the model, and the storage gotcha |
 | [V2_TRAINING.md](docs/V2_TRAINING.md) | V2 architecture, measured throughput, nightly resume |
+| [V2_DATA_CEILING.md](docs/V2_DATA_CEILING.md) | how much admissible data actually exists, and what it means for the target |
 | [OFFLINE_PACK_FORMAT.md](docs/OFFLINE_PACK_FORMAT.md) | pack specification |
 | [PRIVACY.md](docs/PRIVACY.md) | what the app does, and how to check |
 | [SECURITY.md](docs/SECURITY.md) | threat model, untrusted-pack handling, known gaps |
