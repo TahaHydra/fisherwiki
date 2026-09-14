@@ -107,6 +107,7 @@ from fwml.shards import ShardIndex, ShardReader, ShardStream  # noqa: E402
 @dataclass
 class V2Config:
     shards: str = ""
+    val_shards: str = ""
     out: str = ""
     backbone: str = "efficientnet_v2_s"
     num_classes: int = 0
@@ -367,6 +368,80 @@ def build_scheduler(optimizer, cfg: V2Config, total_steps: int):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+@torch.no_grad()
+def evaluate(model, root: Path, cfg: V2Config, resolution: int, device,
+             world: int, rank: int, split: str = "validation",
+             max_batches: int | None = None) -> dict:
+    """Top-1/top-5 on a held-out split, reduced across ranks.
+
+    Counts are all-reduced rather than gathered: every rank evaluates its own
+    shard slice and only the two integers need to meet, which keeps this cheap
+    enough to run every epoch. Reporting rank 0's slice alone would silently
+    measure an eighth of the split on 8 GPUs.
+
+    `final_test` is refused here. It is not in the open manifest at all, so this
+    is belt and braces rather than the seal itself - but a typo should fail
+    loudly rather than quietly evaluate nothing.
+    """
+    if split == "final_test":
+        raise ValueError(
+            "final_test is sealed; evaluate on validation or dev_test. "
+            "See tools/dataset.py v2-release-eval."
+        )
+    if not root.exists():
+        return {}
+    index = ShardIndex(root)
+    # Shards are written one directory per split, so a directory asked for
+    # "validation" may legitimately hold only "dev_test". Fall back to the
+    # single split it does contain, and say so - returning an empty result
+    # would look identical to "evaluated and scored zero".
+    present = sorted({s for s in index.table.column("split").to_pylist()})
+    if split not in present:
+        if len(present) == 1:
+            split = present[0]
+        else:
+            return {}
+    stream = ShardStream(index, split, seed=cfg.seed, shuffle=False,
+                         world_size=world, rank=rank)
+    rows = list(stream.epoch_rows(0))
+    if not rows:
+        return {}
+    ds = ShardRowDataset(root, rows, resolution, False, cfg.seed, 0)
+    loader = DataLoader(ds, batch_size=max(1, cfg.batch_size), shuffle=False,
+                        num_workers=cfg.workers, pin_memory=True,
+                        collate_fn=collate_batch, drop_last=False)
+    model.eval()
+    top1 = top5 = seen = 0
+    for i, batch in enumerate(loader):
+        if max_batches and i >= max_batches:
+            break
+        x, y = batch
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        with torch.amp.autocast("cuda", dtype=torch.float16,
+                                enabled=cfg.amp and device.type == "cuda"):
+            logits = model(x)["species"].float()
+        k = min(5, logits.size(1))
+        pred = logits.topk(k, dim=1).indices
+        hit = pred.eq(y.view(-1, 1))
+        top1 += int(hit[:, 0].sum())
+        top5 += int(hit.any(dim=1).sum())
+        seen += int(y.numel())
+    model.train()
+
+    if world > 1:
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            tally = torch.tensor([top1, top5, seen], device=device, dtype=torch.float64)
+            dist.all_reduce(tally, op=dist.ReduceOp.SUM)
+            top1, top5, seen = (int(v) for v in tally.tolist())
+    if not seen:
+        return {}
+    return {"split": split, "n": seen,
+            "top1": round(top1 / seen, 4), "top5": round(top5 / seen, 4)}
+
+
 def train(cfg: V2Config, hours: float | None, resume: bool, log=print) -> int:
     rank, world, local = ddp_setup()
     info = env.setup(quiet=not is_main(rank))
@@ -374,6 +449,11 @@ def train(cfg: V2Config, hours: float | None, resume: bool, log=print) -> int:
     env.seed_everything(cfg.seed + rank)
 
     root = Path(cfg.shards)
+    # Splits live in sibling directories (shards/train, shards/validation, ...)
+    # so final_test is physically separate from anything training reads.
+    val_root = Path(cfg.val_shards) if cfg.val_shards else root.parent / "validation"
+    if not (val_root / "index.parquet").exists():
+        val_root = None
     index = ShardIndex(root)
     if not cfg.num_classes:
         cfg.num_classes = int(max(index.table.column("class_id").to_pylist())) + 1
@@ -541,18 +621,37 @@ def train(cfg: V2Config, hours: float | None, resume: bool, log=print) -> int:
         state.epoch += 1
         state.samples_this_epoch = 0
         barrier(world)
+        metrics = {}
+        if val_root is not None:
+            metrics = evaluate(model, val_root, cfg, resolution, device,
+                               world, rank, "validation")
+            if metrics and is_main(rank):
+                log(f"  {metrics['split']}: top1 {metrics['top1']:.4f}  "
+                    f"top5 {metrics['top5']:.4f}  (n={metrics['n']:,})")
+
+        improved = bool(metrics) and metrics["top1"] > state.best_metric
         if is_main(rank):
             state.history.append({
                 "epoch": state.epoch, "step": state.global_step,
                 "resolution": resolution,
                 "seconds": round(state.seconds_trained, 1),
+                **({f"val_{k}": v for k, v in metrics.items() if k != "split"}),
             })
+            if improved:
+                state.best_metric = metrics["top1"]
+                state.best_epoch = state.epoch
             manager.save_training_state(
                 model=model, optimizer=optimizer, scheduler=scheduler,
                 scaler=scaler, state=state, config=asdict(cfg),
             )
-            manager.save_best(model=model, state=state, config=asdict(cfg))
-            log(f"epoch {state.epoch} complete")
+            # Only overwrite best.pt on a real improvement: it is what export
+            # and evaluation read, and replacing it every epoch would mean the
+            # last epoch wins rather than the best one.
+            if improved or not manager.best.exists():
+                manager.save_best(model=model, state=state, config=asdict(cfg))
+            log(f"epoch {state.epoch} complete"
+                + (f"  (best top1 {state.best_metric:.4f} @ epoch "
+                   f"{state.best_epoch})" if state.best_metric > float('-inf') else ""))
         barrier(world)
 
     if is_main(rank):
@@ -575,6 +674,8 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--shards", required=True)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--val-shards", default=None,
+                    help="defaults to <shards>/../validation")
     ap.add_argument("--hours", type=float, default=None,
                     help="stop cleanly before this many hours elapse")
     ap.add_argument("--backbone", default="efficientnet_v2_s")
@@ -591,7 +692,8 @@ def main(argv=None) -> int:
 
     out = args.out or str(Path(args.shards).parent / "runs" / f"v2_{args.backbone}")
     cfg = V2Config(
-        shards=args.shards, out=out, backbone=args.backbone,
+        shards=args.shards, val_shards=args.val_shards or "",
+        out=out, backbone=args.backbone,
         batch_size=args.batch_size, accum_steps=args.accum_steps,
         epochs=args.epochs, lr=args.lr, workers=args.workers, seed=args.seed,
         checkpoint_minutes=args.checkpoint_minutes, amp=not args.no_amp,
