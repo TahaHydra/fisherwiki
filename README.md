@@ -97,6 +97,17 @@ different claims.
   logic that decides what the user is told is unit-tested on the desktop against
   the same ONNX Runtime API and the same model bytes. But UI, camera and
   permissions are unexercised.
+* **The preprocessing parity number does not cover the on-device decoder.**
+  The measured 0.017 max-diff figure compares `Preprocessor.toTensor` against
+  the Python training pipeline starting from **identical, already-decoded
+  pixels** — it says nothing about `ImageLoading.kt`, the code that actually
+  turns a phone photo into those pixels: `BitmapFactory`'s JPEG decode,
+  power-of-2 `inSampleSize` downsampling before `Preprocessor` ever runs (a
+  step training's PIL-based pipeline does not have at all), and EXIF rotation
+  applied via an Android `Matrix` rather than PIL's `exif_transpose`. None of
+  this is exercised by any test, on the desktop or otherwise — closing it
+  needs either a device/AVD or a Robolectric shadow of `BitmapFactory`
+  precise enough to trust, neither of which exists here yet.
 * **Photographer generalisation is weak, and thinly measured.** Top-1 drops from
   0.5356 to **0.3113** on the 257 test images from photographers absent from
   training. The split has no same-observation leakage, but photographers span

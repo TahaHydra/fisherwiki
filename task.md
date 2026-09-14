@@ -125,6 +125,15 @@ combined.
     `PickVisualMedia` may already cover it, needs checking). `abortOnError`
     is already `true`; these are style/completeness, not correctness, which
     is why they were left for this pass rather than mixed into it.
+12. **Extend preprocessing parity to `ImageLoading.kt`, not just
+    `Preprocessor`.** The 0.017 max-diff figure starts from identical,
+    already-decoded pixels on both sides — it never exercises
+    `BitmapFactory`'s JPEG decode, the power-of-2 `inSampleSize`
+    downsampling done before `Preprocessor` runs (training's PIL pipeline has
+    no equivalent step), or EXIF rotation via Android's `Matrix` versus PIL's
+    `exif_transpose`. Needs a device/AVD, or a Robolectric shadow of
+    `BitmapFactory` trustworthy enough to stand in for one — neither exists
+    here yet.
 
 ---
 
