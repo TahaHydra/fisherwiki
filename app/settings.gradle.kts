@@ -29,3 +29,8 @@ include(":core")
 
 // The Android application. Thin UI + platform adapters over :core.
 include(":android")
+
+// Desktop manual-testing CLI. Same :core engine, same real .fwpack path, same
+// preprocessing/calibration/taxonomy/open-set logic as the phone - a platform
+// adapter over :core exactly like :android is, for when there is no device.
+include(":cli")

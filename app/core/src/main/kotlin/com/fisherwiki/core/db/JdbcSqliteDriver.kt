@@ -7,10 +7,20 @@ import java.sql.ResultSet
 /**
  * Desktop [SqliteDriver] backed by `org.xerial:sqlite-jdbc`.
  *
- * Test-scope only. Its existence is what lets the whole of
- * [SpeciesRepository] - every query, join and result mapping that ships - be
- * exercised against a real pack database on a workstation, with the Android
- * driver providing the same three methods on device.
+ * Lives in `:core`'s main source set even though the only two consumers today
+ * are `:core`'s own JVM tests and the `:cli` desktop tool, not the Android app.
+ * That is deliberate: this class has **no compile-time dependency on
+ * `sqlite-jdbc`** - it only touches `java.sql.*`, which is standard JDK API.
+ * `org.xerial:sqlite-jdbc` registers itself with [DriverManager] via the
+ * standard JDBC `META-INF/services` mechanism, purely at runtime, so whoever
+ * actually wants a working connection (a test, or the CLI) supplies that jar
+ * on their own runtime classpath. Android never does, and never needs to: it
+ * has `AndroidSqliteDriver` instead, going through the platform's own SQLite.
+ *
+ * Its existence is what lets the whole of [SpeciesRepository] - every query,
+ * join and result mapping that ships - be exercised against a real pack
+ * database on a workstation, with the Android driver providing the same three
+ * methods on device.
  */
 class JdbcSqliteDriver(path: String, readOnly: Boolean = true) : SqliteDriver {
 

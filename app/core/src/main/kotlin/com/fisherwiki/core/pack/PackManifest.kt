@@ -153,6 +153,19 @@ data class CalibrationSpec(
     @SerialName("per_class_threshold") val perClassThreshold: Map<String, Float> = emptyMap(),
     /** Measured expected calibration error on the held-out set, for display. */
     @SerialName("expected_calibration_error") val expectedCalibrationError: Float? = null,
+    /**
+     * Which split `ml/evaluate.py --fit-calibration` was run on (normally
+     * `"val"`), and how many images that split had. Provenance for the
+     * numbers above, not consumed by any ranking logic.
+     *
+     * Missing here until `:cli` loaded the real, currently-shipping
+     * `global_v1-v1.fwpack` and the manifest's strict parser rejected the
+     * whole pack over it - the same gap, and the same cause, as
+     * [RegionSpec.rationale]: nothing before this CLI had ever deserialized
+     * a real, fully-pipeline-built manifest with this strict parser.
+     */
+    @SerialName("fitted_on") val fittedOn: String? = null,
+    @SerialName("fitted_images") val fittedImages: Int? = null,
 )
 
 @Serializable
@@ -163,6 +176,23 @@ data class RegionSpec(
     val water: String = "any",
     /** `[latMin, latMax, lonMin, lonMax]` boxes in WGS84 degrees. */
     val boxes: List<List<Double>> = emptyList(),
+    /**
+     * Human-authored justification for this region's boxes, e.g. "Baja
+     * through Alaska; a cold-temperate fauna quite unlike the Atlantic
+     * coast." Present on every region `tools/fwdata/regions.py` defines.
+     *
+     * This field was missing here until the desktop CLI (`:cli`) tried to
+     * load the real, currently-shipping `global_v1-v1.fwpack` and the
+     * manifest's strict `ignoreUnknownKeys = false` parser rejected the
+     * whole pack over it. Nothing before that had ever deserialized a real
+     * manifest with this parser: `EngineEndToEndTest` uses a small fixture
+     * pack, and the Python `verify_pack.py` validates with its own separate
+     * JSON handling, not this class. Kept as `String`, not `String?`, and
+     * defaulted to `""` (matching the Python writer's own default) so a
+     * manifest that omits it - old packs, or a future writer that drops it -
+     * still parses.
+     */
+    val rationale: String = "",
 )
 
 /** Where the training data came from and under what licence. */
