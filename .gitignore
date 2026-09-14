@@ -79,3 +79,8 @@ captures/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Scratch files dropped at the repo root during a session (e.g. a commit
+# message staged via -F before `git commit`). Never intentionally tracked.
+/_scratch_*
+/_commit_msg.txt

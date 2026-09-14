@@ -59,7 +59,11 @@ def main(argv=None) -> int:
     ap.add_argument("--display-name", default="Global Angler")
     ap.add_argument("--pack-version", type=int, default=1)
     ap.add_argument("--quantization", default="fp16",
-                    choices=["fp32", "fp16", "int8"])
+                    choices=["fp32", "fp16", "int8"],
+                    help="fp32 ships unquantized; int8 uses the static "
+                         "estimator (see docs/MODEL.md for why: dynamic INT8 "
+                         "measured ~25x slower, and static's own accuracy "
+                         "cost is the reason fp16 is the default)")
     ap.add_argument("--eval-limit", type=int, default=0,
                     help="cap evaluation images (0 = all)")
     ap.add_argument("--skip-openset", action="store_true")
@@ -96,9 +100,25 @@ def main(argv=None) -> int:
         print("3/6  open-set evaluation skipped\n", flush=True)
 
     # 4. export
+    #
+    # This script's own --quantization vocabulary (fp32/fp16/int8) is the
+    # user-facing one build_pack.py also uses, to pick which exported .onnx
+    # file to embed; ml/export.py's --quantize vocabulary is one level more
+    # specific (none/fp16/int8_dynamic/int8_static), because int8 needs to
+    # say *which* calibration method produced it. Passing args.quantization
+    # straight through used to just be wrong for "fp32" and "int8" -
+    # export.py would reject "fp32" outright (not one of its choices) and
+    # silently do the wrong quantisation method for "int8". Mapped explicitly
+    # here instead of papering over the mismatch by widening export.py's own
+    # vocabulary, which callers other than this script also depend on.
+    export_quantize = {
+        "fp32": "none",
+        "fp16": "fp16",
+        "int8": "int8_static",
+    }[args.quantization]
     run(f"4/6  export {args.quantization} ONNX and measure the exported graph",
         [PY_TRAIN, "ml/export.py", "--run", run_dir,
-         "--quantize", args.quantization, "--check-accuracy", "2000"])
+         "--quantize", export_quantize, "--check-accuracy", "2000"])
 
     # 5. pack
     run("5/6  build the pack",

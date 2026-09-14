@@ -491,19 +491,40 @@ def main(argv=None) -> int:
         log(f"  fp32: top1 {base['top1']:.4f}  top5 {base['top5']:.4f}  "
             f"(n={base['images']:,})")
 
-        qpath = out_dir / "model_int8.onnx"
-        if qpath.exists():
-            q = accuracy_on_split(qpath, corpus, size, args.split,
+        # Compare against whichever variant this run actually produced, not
+        # a hardcoded model_int8.onnx. That hardcoding meant --quantize fp16
+        # - the default, and what actually ships - silently skipped this
+        # whole comparison: model_fp16.onnx was never model_int8.onnx, so
+        # `qpath.exists()` was always false and no accuracy_<variant> ever
+        # appeared in the report for the one variant that matters. The
+        # standalone fp16-vs-fp32 numbers in docs/MODEL.md came from a
+        # separate one-off comparison script, not from this flag - this is
+        # what makes running this flag again actually re-verify them.
+        variant_file = {
+            "none": None,
+            "fp16": out_dir / "model_fp16.onnx",
+            "int8_dynamic": out_dir / "model_int8.onnx",
+            "int8_static": out_dir / "model_int8.onnx",
+        }[args.quantize]
+
+        if variant_file is None:
+            log("  (--quantize none: nothing to compare fp32 against)")
+        elif not variant_file.exists():
+            log(f"  WARNING: expected {variant_file.name} from this run but it is "
+                f"missing; accuracy_{args.quantize} was not measured")
+        else:
+            q = accuracy_on_split(variant_file, corpus, size, args.split,
                                   args.check_accuracy)
             agree = (
                 sum(1 for a, b in zip(base["predictions"], q["predictions"])
                     if a == b) / max(1, len(q["predictions"]))
             )
-            report["accuracy_int8"] = {k: v for k, v in q.items()
-                                       if k not in ("predictions", "labels")}
-            report["int8_top1_agreement_with_fp32"] = agree
-            report["int8_top1_delta"] = q["top1"] - base["top1"]
-            log(f"  int8: top1 {q['top1']:.4f}  top5 {q['top5']:.4f}")
+            key = args.quantize
+            report[f"accuracy_{key}"] = {k: v for k, v in q.items()
+                                         if k not in ("predictions", "labels")}
+            report[f"{key}_top1_agreement_with_fp32"] = agree
+            report[f"{key}_top1_delta"] = q["top1"] - base["top1"]
+            log(f"  {key}: top1 {q['top1']:.4f}  top5 {q['top5']:.4f}")
             log(f"  delta: {q['top1'] - base['top1']:+.4f} top-1, "
                 f"{100 * agree:.1f}% of predictions identical to fp32")
 
