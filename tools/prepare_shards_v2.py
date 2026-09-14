@@ -63,17 +63,21 @@ def build(
     out_dir: Path,
     *,
     db_path: Path | None = None,
-    short_edge: int = 512,
+    long_edge: int = 512,
     quality: int = 90,
     shard_size: int = 2048,
     limit: int | None = None,
-    crop_pad: float = 0.12,
+    crop_pad: float = 0.25,
+    whole_frame_fraction: float = 0.15,
+    min_crop_px: int = 224,
+    only_detected: bool = False,
     splits: tuple[str, ...] = ("train", "validation", "dev_test", "final_test"),
     log=_log,
 ) -> dict:
     import duckdb
     from PIL import Image
 
+    from fwml.crop_v2 import expand_box, grow_box_to_min
     from fwml.shards import Sample, ShardWriter, write_manifest
 
     con = duckdb.connect(str(db_path or PATHS.provenance_db), read_only=True)
@@ -86,10 +90,16 @@ def build(
         if has_detections else ""
     )
     detect_cols = (
-        "d.x0, d.y0, d.x1, d.y1, d.score" if has_detections
+        "any_value(d.x0) AS x0, any_value(d.y0) AS y0, any_value(d.x1) AS x1, "
+        "any_value(d.y1) AS y1, any_value(d.score) AS score"
+        if has_detections
         else "NULL AS x0, NULL AS y0, NULL AS x1, NULL AS y1, NULL AS score"
     )
 
+    detect_filter = (
+        "AND EXISTS (SELECT 1 FROM detections dd WHERE dd.sha256 = m.sha256)"
+        if (only_detected and has_detections) else ""
+    )
     placeholders = ",".join("?" * len(splits))
     rows = con.execute(
         f"""
@@ -106,8 +116,8 @@ def build(
           AND NOT EXISTS (
               SELECT 1 FROM split_quarantine q
               WHERE q.dataset_version = m.dataset_version AND q.sha256 = m.sha256)
-        GROUP BY m.sha256, g.split, g.taxon_id, g.group_id{
-            ", d.x0, d.y0, d.x1, d.y1, d.score" if has_detections else ""}
+          {detect_filter}
+        GROUP BY m.sha256, g.split, g.taxon_id, g.group_id
         ORDER BY g.split, g.taxon_id, m.sha256
         """,
         [DATASET_VERSION, *splits],
@@ -128,6 +138,7 @@ def build(
 
     cas_root = PATHS.cas
     counts: dict[str, int] = {}
+    variants: dict[str, int] = {}
     failures = 0
     t0 = time.time()
 
@@ -139,19 +150,33 @@ def build(
             if src is None or not src.exists():
                 failures += 1
                 continue
+            # Deterministic choice of crop vs whole frame, by content hash, so
+            # a rebuild makes the same choice and a resumed run does not drift.
+            keep_whole = (
+                split == "train"
+                and x0 is not None
+                and (int(sha[:8], 16) % 1000) < int(whole_frame_fraction * 1000)
+            )
+            variant = "whole" if (x0 is None or keep_whole) else "crop"
+
             try:
                 with Image.open(src) as im:
                     im = im.convert("RGB")
-                    if x0 is not None:
-                        w, h = im.size
-                        bw, bh = (x1 - x0), (y1 - y0)
-                        px, py = bw * crop_pad, bh * crop_pad
-                        im = im.crop((
-                            max(0, int(x0 - px)), max(0, int(y0 - py)),
-                            min(w, int(x1 + px)), min(h, int(y1 + py)),
-                        ))
                     w, h = im.size
-                    scale = short_edge / min(w, h)
+                    if variant == "crop":
+                        box = expand_box((x0, y0, x1, y1), w, h, context=crop_pad)
+                        box = grow_box_to_min(box, w, h, min_crop_px)
+                        if box[2] - box[0] >= 16 and box[3] - box[1] >= 16:
+                            im = im.crop(box)
+                        else:
+                            variant = "whole"   # degenerate box, keep the frame
+                    # Bound the LONG edge and preserve aspect. Never resize to a
+                    # fixed shape: stretching a disc-shaped fish into a wide
+                    # rectangle is what made Fishial call an ocean sunfish a
+                    # remora at 98.4% confidence. Letterboxing happens at train
+                    # time, so nothing is padded on disk.
+                    w, h = im.size
+                    scale = long_edge / max(w, h)
                     if scale < 1.0:
                         im = im.resize(
                             (max(1, round(w * scale)), max(1, round(h * scale))),
@@ -164,6 +189,7 @@ def build(
             except Exception:
                 failures += 1
                 continue
+            variants[variant] = variants.get(variant, 0) + 1
 
             writer = writers.get(split)
             if writer is None:
@@ -186,7 +212,10 @@ def build(
 
     meta = {
         "dataset_version": DATASET_VERSION,
-        "short_edge": short_edge,
+        "long_edge": long_edge,
+        "whole_frame_fraction": whole_frame_fraction,
+        "min_crop_px": min_crop_px,
+        "variants": variants,
         "jpeg_quality": quality,
         "crop_pad": crop_pad,
         "used_detections": has_detections,
@@ -201,7 +230,7 @@ def build(
     }
     write_manifest(out_dir, meta)
     log(f"wrote {sum(counts.values()):,} samples in "
-        f"{time.time() - t0:.0f}s ({failures} failed)")
+        f"{time.time() - t0:.0f}s ({failures} failed); variants {variants}")
     for split, n in sorted(counts.items()):
         log(f"  {split:12} {n:>9,}")
     return meta
@@ -211,17 +240,29 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--short-edge", type=int, default=512)
+    ap.add_argument("--long-edge", type=int, default=512)
+    ap.add_argument("--only-detected", action="store_true",
+                    help="prepare only images that already have a detection row, "
+                         "for incremental runs while detection is still going")
+    ap.add_argument("--whole-frame-fraction", type=float, default=0.15,
+                    help="deterministic share of TRAIN kept uncropped, so the "
+                         "model still handles the no-detection fallback")
     ap.add_argument("--quality", type=int, default=90)
     ap.add_argument("--shard-size", type=int, default=2048)
-    ap.add_argument("--crop-pad", type=float, default=0.12)
+    ap.add_argument("--crop-pad", type=float, default=0.25)
+    ap.add_argument("--min-crop-px", type=int, default=224,
+                    help="widen small boxes with real context instead of "
+                         "upscaling a tiny crop at train time")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--splits", default="train,validation,dev_test,final_test")
     args = ap.parse_args(argv)
 
     build(
-        Path(args.out), short_edge=args.short_edge, quality=args.quality,
+        Path(args.out), long_edge=args.long_edge, quality=args.quality,
         shard_size=args.shard_size, limit=args.limit, crop_pad=args.crop_pad,
+        whole_frame_fraction=args.whole_frame_fraction,
+        min_crop_px=args.min_crop_px,
+        only_detected=args.only_detected,
         splits=tuple(s.strip() for s in args.splits.split(",") if s.strip()),
     )
     return 0

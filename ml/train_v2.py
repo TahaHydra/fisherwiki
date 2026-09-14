@@ -177,7 +177,8 @@ class ShardRowDataset(Dataset):
 
         from PIL import Image
 
-        from fwml.data import AugmentConfig, to_tensor, train_transform
+        from fwml.crop_v2 import eval_transform_v2, train_transform_v2
+        from fwml.data import AugmentConfig, to_tensor
 
         self._ensure()
         assert self._index is not None and self._reader is not None
@@ -209,11 +210,9 @@ class ShardRowDataset(Dataset):
                 (self.seed * 1_000_003 + self.epoch * 7_919_837 + row) & 0x7FFFFFFF
             )
             cfg = AugmentConfig(size=self.resolution)
-            img = train_transform(img, cfg, rng)
+            img = train_transform_v2(img, cfg, rng)
         else:
-            from fwml.data import eval_transform
-
-            img = eval_transform(img, self.resolution)
+            img = eval_transform_v2(img, self.resolution)
         cls = self._index.table.column("class_id")[row].as_py()
         return to_tensor(img), int(cls)
 

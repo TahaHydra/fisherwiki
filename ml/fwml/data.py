@@ -140,7 +140,17 @@ def train_transform(img: Image.Image, cfg: AugmentConfig, rng: random.Random) ->
     if rng.random() < cfg.hflip_prob:
         img = ImageOps.mirror(img)
 
-    # --- photometric --------------------------------------------------------
+    return photometric(img, cfg, rng)
+
+
+def photometric(img: Image.Image, cfg: AugmentConfig, rng: random.Random) -> Image.Image:
+    """Colour, blur and recompression augmentation.
+
+    Split out of :func:`train_transform` so the V2 crop path
+    (:mod:`fwml.crop_v2`) can share it rather than growing a second, slowly
+    diverging copy. The order of `rng` calls is unchanged, so V1 runs reproduce
+    byte for byte - pinned by `test_v1_photometric_is_unchanged_by_the_refactor`.
+    """
     if cfg.brightness:
         img = ImageEnhance.Brightness(img).enhance(
             1.0 + rng.uniform(-cfg.brightness, cfg.brightness)
