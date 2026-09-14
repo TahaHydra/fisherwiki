@@ -182,10 +182,34 @@ A corpus is reproducible from:
 * the split salt (the corpus name),
 * the code commit.
 
-Split assignment is a SHA-256 of the group key rather than a shuffle, so it is
-stable across runs, machines and corpus growth: adding new images never moves an
-existing observation between splits. That is what makes "never tune against the
-test set" enforceable rather than aspirational.
+Split assignment is a hash of the group key rather than a shuffle, so it is at
+least **stable across runs and machines**: rebuilding the same corpus from the
+same data always reproduces the same split, deterministically (pinned by
+`test_rebuilding_gives_the_same_split`).
+
+**Stability under corpus growth is weaker than that, and this document
+previously overstated it.** The OBSERVER strategy genuinely is immune to
+growth: it assigns each group a fixed hash fraction, independent of every
+other group, so adding data can only ever change the *new* groups' splits.
+The OBSERVATION strategy - the one actually used to build `global_v1`, chosen
+because the observer-independent version left 284 classes with no validation
+images at all - instead *ranks* each class's groups by hash and keeps the
+top `ceil(n × 0.8)` as train, where `n` is that class's current group count.
+Adding a group to a class can shift both an existing group's rank among its
+now-larger class and the boundary itself, so an existing observation's split
+*can* change. `test_growth_can_move_an_existing_observation` demonstrates this
+directly against the real corpus builder, not just in theory.
+
+Practically: a corpus rebuild after adding data is not guaranteed to leave
+every previous train/val/test assignment untouched for classes built with the
+OBSERVATION strategy. "Never tune against the test set" is still enforced
+*within one corpus build* - the held-out test split is read once per run,
+which is the actual mechanism the promise depends on - but is not yet a
+promise that survives rebuilding the corpus with more data. See `task.md` for
+the two ways to close this gap: version corpus builds so an old test split can
+be pinned and re-evaluated exactly, or make split assignment for small classes
+growth-stable by some other means without reintroducing the 284-classes
+problem.
 
 Every training run records the corpus manifest's SHA-256 and the code commit in
 `run.json`, and both are propagated into the pack manifest — so a model in the

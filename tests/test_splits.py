@@ -244,7 +244,19 @@ class TestBuilderProducesCleanSplits:
     def test_adding_images_does_not_move_existing_observations(
         self, tmp_path, monkeypatch
     ):
-        """The property that makes 'never tune against test' enforceable."""
+        """One specific, realistic growth scenario stays stable.
+
+        This is *not* a proof that OBSERVATION-strategy splits are stable in
+        general - see `test_growth_can_move_an_existing_observation` right
+        below, which demonstrates the opposite with a different, equally
+        realistic scenario. Both are real: this file's own group_split SQL
+        ranks each class's groups by hash and cuts at a percentage of the
+        *current* count, so an existing group's split can depend on how many
+        groups its class has grown to, not only on that group's own key. This
+        test remains worth keeping - "this specific realistic case is fine"
+        is still useful to pin - but its docstring used to claim the general
+        property, and the claim was wrong.
+        """
         import duckdb
 
         base = _rows(n_classes=3, groups_per_class=20)
@@ -285,6 +297,69 @@ class TestBuilderProducesCleanSplits:
 
         moved = [cid for cid, split in before.items() if after.get(cid) != split]
         assert moved == [], f"{len(moved)} observations changed split on rebuild"
+
+    def test_growth_can_move_an_existing_observation(self, tmp_path, monkeypatch):
+        """The OBSERVATION-strategy cut is rank-within-class, not a fixed hash
+        threshold: `group_split`'s SQL ranks a class's groups by
+        `hash(split_group || salt)` and keeps ranks `1..ceil(n * frac)` as
+        train, where `n` is the class's *current* group count. Add one group
+        and two things can move: the new group's hash can sort ahead of an
+        existing group (changing that group's rank even though its own key is
+        untouched), and the boundary `ceil(n * frac)` itself shifts.
+
+        This is an existing, accepted trade-off - it is what fixed 284
+        classes having no validation images, documented in this file's own
+        comments - not new. What was wrong was documenting the *other*
+        property (immutability under growth) as if it were proven, when only
+        one non-adversarial instance of it had ever been checked. This test
+        is the adversarial instance: many classes, one new group added to
+        each, so that at least one demonstrates the boundary moving even
+        though any single class might not (the previous test's class did
+        not, which is exactly why one passing instance was never a proof).
+        """
+        import duckdb
+
+        n_classes = 30
+        base = _rows(n_classes=n_classes, groups_per_class=20)
+        db = _make_store(tmp_path, monkeypatch, base)
+        b = CorpusBuilder(db)
+        try:
+            b.build("t", min_images_per_class=5, min_observations_per_class=3,
+                    log=lambda m: None)
+            before = dict(b.con.execute(
+                "SELECT candidate_id, split FROM corpus_members WHERE corpus='t'"
+            ).fetchall())
+        finally:
+            b.close()
+
+        con = duckdb.connect(str(db))
+        extra = [
+            (f"src:new{c}", f"{900000 + c:064x}", 1000 + c,
+             f"Genus{c} species{c}", f"obs-{c}-new", f"user-{c}-new",
+             None, None, "x/y/z.jpg", 500, 375, "2024-01-01", "CC-BY-4.0")
+            for c in range(n_classes)
+        ]
+        con.executemany("INSERT INTO prov_src VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", extra)
+        con.close()
+
+        b = CorpusBuilder(db)
+        try:
+            b.build("t", min_images_per_class=5, min_observations_per_class=3,
+                    log=lambda m: None)
+            after = dict(b.con.execute(
+                "SELECT candidate_id, split FROM corpus_members WHERE corpus='t'"
+            ).fetchall())
+        finally:
+            b.close()
+
+        moved = [cid for cid, split in before.items() if after.get(cid) != split]
+        assert moved, (
+            "expected at least one existing observation to change split across "
+            f"{n_classes} classes when one group was added to each - if this now "
+            "fails, either the algorithm became growth-stable (update "
+            "docs/DATA_PROVENANCE.md's claim back to unconditional and remove "
+            "this test) or the test fixture no longer exercises the boundary"
+        )
 
 
 class TestObserverStrategyFallsBackSafely:

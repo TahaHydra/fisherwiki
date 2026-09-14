@@ -91,6 +91,14 @@ combined.
 7. **In-app pack download.** Not built, and the app now requests no network
    permission at all. Re-adding `INTERNET` is a prerequisite and should be a
    visible, reviewed change.
+8. **Growth-stable splitting.** The OBSERVATION strategy's rank-within-class
+   cut can move an existing observation to a different split when the corpus
+   grows (proven by `test_growth_can_move_an_existing_observation`; see
+   [`docs/DATA_PROVENANCE.md` §8](docs/DATA_PROVENANCE.md)). Either version
+   corpus builds so an old test split can be pinned and re-evaluated exactly,
+   or find a growth-stable assignment rule for small classes that does not
+   reintroduce the 284-classes-with-no-validation-images problem the current
+   rule exists to fix.
 
 ---
 
