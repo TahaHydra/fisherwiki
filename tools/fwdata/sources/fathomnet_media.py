@@ -19,21 +19,34 @@ from ..provenance import ImageProvenance, ProvenanceDB
 from ..taxonomy.registry import TaxonRecord
 
 API = "https://database.fathomnet.org/api/images/query/concept"
+_PROVIDER_DOWN = False
+_LAST_ERROR: str | None = None
+_WARNED = False
 
 
 def _json(url: str):
-    # FathomNet has had intermittent 503 periods. Discovery runs over thousands
-    # of taxa, so spending the generic multi-retry budget on every taxon would
-    # turn one provider outage into an all-night no-op. One short attempt here;
-    # the orchestrator leaves failed taxa uncheckpointed and a later run retries.
-    return json.loads(
-        net.fetch_bytes(
-            url,
-            accept="application/json",
-            max_attempts=1,
-            timeout=(5, 15),
-        ).decode("utf-8")
-    )
+    """One short provider attempt, then circuit-break for this process.
+
+    FathomNet has had intermittent 503 periods. Without a breaker a 37k-taxon
+    discovery would turn one outage into hours of identical retries. A new
+    invocation resets the breaker and therefore retries the provider naturally.
+    """
+    global _PROVIDER_DOWN, _LAST_ERROR
+    if _PROVIDER_DOWN:
+        return None
+    try:
+        return json.loads(
+            net.fetch_bytes(
+                url,
+                accept="application/json",
+                max_attempts=1,
+                timeout=(5, 15),
+            ).decode("utf-8")
+        )
+    except Exception as exc:
+        _PROVIDER_DOWN = True
+        _LAST_ERROR = f"{type(exc).__name__}: {exc}"
+        return None
 
 
 def _ext(url: str) -> str:
@@ -59,11 +72,18 @@ def discover_taxon(
     state: ScanState | None = None,
     log=print,
 ) -> int:
+    global _WARNED
     state = state or ScanState("fathomnet")
     if not state.needs(taxon.fw_taxon_id, cap):
         return 0
     url = f"{API}/{quote(taxon.canonical_name, safe='')}"
     obj = _json(url)
+    if obj is None:
+        if not _WARNED:
+            log(f"  FathomNet unavailable; skipping for this run: {_LAST_ERROR}")
+            _WARNED = True
+        # Deliberately NOT checkpointed. The next acquire_v2 invocation retries.
+        return 0
     if not isinstance(obj, list):
         return 0
 
