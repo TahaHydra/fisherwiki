@@ -1,7 +1,7 @@
 """FathomNet underwater fish-image acquisition.
 
-FathomNet exposes concept-labelled images and human-drawn boxes.  We query by
-scientific name through the public API.  A single frame may contain multiple
+FathomNet exposes concept-labelled images and human-drawn boxes. We query by
+scientific name through the public API. A single frame may contain multiple
 species; FisherWiki registers one candidate identity per (image, taxon), and its
 existing exact-hash/conflict quarantine prevents contradictory labels from
 silently entering different model classes.
@@ -22,7 +22,18 @@ API = "https://database.fathomnet.org/api/images/query/concept"
 
 
 def _json(url: str):
-    return json.loads(net.fetch_bytes(url, accept="application/json").decode("utf-8"))
+    # FathomNet has had intermittent 503 periods. Discovery runs over thousands
+    # of taxa, so spending the generic multi-retry budget on every taxon would
+    # turn one provider outage into an all-night no-op. One short attempt here;
+    # the orchestrator leaves failed taxa uncheckpointed and a later run retries.
+    return json.loads(
+        net.fetch_bytes(
+            url,
+            accept="application/json",
+            max_attempts=1,
+            timeout=(5, 15),
+        ).decode("utf-8")
+    )
 
 
 def _ext(url: str) -> str:
@@ -52,13 +63,7 @@ def discover_taxon(
     if not state.needs(taxon.fw_taxon_id, cap):
         return 0
     url = f"{API}/{quote(taxon.canonical_name, safe='')}"
-    try:
-        obj = _json(url)
-    except Exception as exc:
-        # Do not mark the taxon complete on provider/server failure; a later run
-        # should retry it automatically.
-        log(f"  FathomNet {taxon.canonical_name}: {type(exc).__name__}: {exc}")
-        return 0
+    obj = _json(url)
     if not isinstance(obj, list):
         return 0
 
@@ -76,9 +81,6 @@ def discover_taxon(
             boxes,
             key=lambda b: int(b.get("width") or 0) * int(b.get("height") or 0),
         )
-        # FathomNet's Darwin Core/licence metadata lives separately from the
-        # image DTO. Preserve that the acquisition record is unknown rather than
-        # inventing a permissive value; acquisition itself does not filter it.
         raw_license = ""
         records.append(ImageProvenance(
             source_dataset="fathomnet",
