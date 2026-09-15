@@ -93,7 +93,7 @@ def wait_for_pid(pid: int, poll: float = 20.0) -> None:
     _log(f"pid {pid} has exited")
 
 
-STAGES = ("assign", "verify", "detect", "prepare")
+STAGES = ("assign", "verify", "detect", "prepare", "verify-shards")
 
 
 def main(argv=None) -> int:
@@ -103,8 +103,18 @@ def main(argv=None) -> int:
                     help="wait for this process to exit before starting")
     ap.add_argument("--stages", default=",".join(STAGES))
     ap.add_argument("--batch", default="batch1_inat_topup")
-    ap.add_argument("--shards-out", default=r"D:\fisherwiki-data\v2\shards")
+    # E:, not D:. Measured cold, reading originals from D: is 83% of the
+    # preparation budget, and writing the tars back onto the same spindle makes
+    # the head seek between the two. 479k samples at the measured 30 KB is
+    # ~15 GB, which E: has room for many times over.
+    ap.add_argument("--shards-out", default=r"E:\FisherWiki\shards\v2")
     ap.add_argument("--prepare-limit", type=int, default=None)
+    ap.add_argument("--prepare-workers", type=int, default=4,
+                    help="measured cold: 53 img/s serial, 145 at 4, 146 at 6, "
+                         "139 at 8 - past 4 the readers fight for the spindle")
+    ap.add_argument("--prefer-source", default=None,
+                    help="after a 1024px re-fetch, prepare only this source "
+                         "when a photo exists at two resolutions")
     ap.add_argument("--detect-batch", type=int, default=16)
     ap.add_argument("--detect-workers", type=int, default=4,
                     help="measured fastest end to end; more thrash the HDD")
@@ -136,11 +146,27 @@ def main(argv=None) -> int:
               "--decode-workers", str(detect_workers)], "detect", state)
 
     if "prepare" in wanted:
-        cmd = [PY_TRAIN, "tools/prepare_shards_v2.py", "--out", args.shards_out]
+        cmd = [PY_TRAIN, "tools/prepare_shards_v2.py", "--out", args.shards_out,
+               "--workers", str(args.prepare_workers)]
         if args.prepare_limit:
             cmd += ["--limit", str(args.prepare_limit)]
+        if args.prefer_source:
+            cmd += ["--prefer-source", args.prefer_source]
         if not _run(cmd, "prepare", state):
             return 1
+
+    if "verify-shards" in wanted:
+        # Re-hash a sample of stored crops against the index. The path is not
+        # the hash here, unlike the CAS, so a half-written shard or a bad
+        # transfer would otherwise only surface as unexplained accuracy loss.
+        _run([PY_TRAIN, "-c",
+              "import sys; sys.path.insert(0, 'ml');"
+              "from pathlib import Path;"
+              "from fwml.shards import verify_shards;"
+              f"[verify_shards(Path(r'{args.shards_out}') / s, limit=2000)"
+              " for s in ('train','validation','dev_test','final_test')"
+              f" if (Path(r'{args.shards_out}') / s / 'index.parquet').exists()]"],
+             "verify-shards", state)
 
     _log("pipeline complete")
     _log(f"stages completed: {state['completed']}")
