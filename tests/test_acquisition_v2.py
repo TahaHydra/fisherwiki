@@ -96,13 +96,26 @@ def test_commons_keeps_same_file_assertions_separate_by_taxon(monkeypatch):
 
 
 def test_fathomnet_provider_failure_is_resumable(monkeypatch):
-    monkeypatch.setattr(
-        fathomnet_media, "_json", lambda url: (_ for _ in ()).throw(RuntimeError("503"))
-    )
+    monkeypatch.setattr(fathomnet_media, "_json", lambda url: None)
     st = State()
     assert fathomnet_media.discover_taxon(DB(), taxon(), cap=2, state=st, log=lambda x: None) == 0
     # A provider failure must not poison the durable discovery checkpoint.
     assert st.marked == []
+
+
+def test_fathomnet_circuit_breaker_avoids_repeated_network_calls(monkeypatch):
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append(1)
+        raise RuntimeError("503")
+
+    monkeypatch.setattr(fathomnet_media, "_PROVIDER_DOWN", False)
+    monkeypatch.setattr(fathomnet_media, "_LAST_ERROR", None)
+    monkeypatch.setattr(fathomnet_media.net, "fetch_bytes", fail)
+    assert fathomnet_media._json("https://example.invalid/one") is None
+    assert fathomnet_media._json("https://example.invalid/two") is None
+    assert len(calls) == 1
 
 
 def test_fathomnet_requires_matching_nonrejected_box(monkeypatch):
