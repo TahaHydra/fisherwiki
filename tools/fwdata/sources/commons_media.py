@@ -111,7 +111,11 @@ def discover_taxon(
             pageid = str(page.get("pageid"))
             records.append(ImageProvenance(
                 source_dataset="wikimedia-commons",
-                source_record_id=pageid,
+                # One Commons file can appear in more than one taxon category.
+                # Keep those assertions as separate candidates so exact-hash
+                # conflict quarantine can see the disagreement instead of the
+                # first category silently winning the candidate-id collision.
+                source_record_id=f"{pageid}:{taxon.fw_taxon_id}",
                 image_url=str(url),
                 source_url=str(ii.get("descriptionurl") or f"https://commons.wikimedia.org/?curid={pageid}"),
                 source_taxon_id=taxon.wikidata_qid or str(taxon.fw_taxon_id),
@@ -129,7 +133,7 @@ def discover_taxon(
                 declared_height=ii.get("height"),
                 original_filename=str(page.get("title") or "").removeprefix("File:"),
                 ext=_ext(str(url)),
-                notes=f"commons_category={category}",
+                notes=f"commons_category={category};commons_pageid={pageid}",
             ))
         if records:
             registered += register_candidates(db, records)
