@@ -2,7 +2,7 @@
 
 This adapter intentionally excludes the iNaturalist GBIF dataset mirror because
 those photographs already enter FisherWiki through the native iNaturalist bulk
-export.  Discovery is per FisherWiki species using the registry's GBIF taxon id,
+export. Discovery is per FisherWiki species using the registry's GBIF taxon id,
 so every registered candidate already has a stable internal class id.
 """
 
@@ -102,9 +102,11 @@ def discover_taxon(
     seen_media = 0
     while seen_media < cap:
         limit = min(PAGE, max(1, cap - seen_media))
+        # GBIF occurrence-search parameters are camelCase; using snake_case is
+        # silently ignored and turns a species query into a global one.
         url = API + "?" + urlencode({
-            "media_type": "StillImage",
-            "taxon_key": taxon.gbif_taxon_id,
+            "mediaType": "StillImage",
+            "taxonKey": taxon.gbif_taxon_id,
             "limit": limit,
             "offset": offset,
         })
