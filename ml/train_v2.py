@@ -98,7 +98,14 @@ from fwml.checkpoint import (  # noqa: E402
     load_model_state,
     restore_rng,
 )
-from fwml.shards import ShardIndex, ShardReader, ShardStream  # noqa: E402
+from fwml.shards import (  # noqa: E402
+    ClassMap,
+    ShardIndex,
+    ShardReader,
+    ShardStream,
+    dataset_fingerprint,
+    dataset_fingerprint_diff,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +118,8 @@ class V2Config:
     out: str = ""
     backbone: str = "efficientnet_v2_s"
     num_classes: int = 0
+    #: Escape hatch for resuming across a deliberate corpus change.
+    allow_dataset_change: bool = False
     batch_size: int = 32
     accum_steps: int = 1
     lr: float = 1e-3
@@ -455,8 +464,17 @@ def train(cfg: V2Config, hours: float | None, resume: bool, log=print) -> int:
     if not (val_root / "index.parquet").exists():
         val_root = None
     index = ShardIndex(root)
+    # The class map is authoritative when it exists. Deriving the head width
+    # from max(class_id)+1 silently shrinks the model whenever the highest
+    # class happens to have no samples in this split - and after the class map
+    # became append-only, that is a normal state, not a corrupt one.
+    fingerprint = dataset_fingerprint(root.parent if not (
+        root / ClassMap.FILENAME).exists() else root)
     if not cfg.num_classes:
-        cfg.num_classes = int(max(index.table.column("class_id").to_pylist())) + 1
+        cfg.num_classes = (
+            fingerprint.get("num_classes")
+            or int(max(index.table.column("class_id").to_pylist())) + 1
+        )
 
     ckpt_dir = Path(cfg.out)
     manager = CheckpointManager(ckpt_dir)
@@ -482,6 +500,28 @@ def train(cfg: V2Config, hours: float | None, resume: bool, log=print) -> int:
 
     ckpt = manager.load() if resume else None
     if ckpt:
+        # A checkpoint's classifier head means whatever the class map said when
+        # it was written. Resuming against a differently prepared corpus either
+        # crashes on a shape mismatch - the good case - or trains on shifted
+        # labels, which nothing downstream detects.
+        stored_fp = ckpt.get("dataset_fingerprint")
+        if stored_fp:
+            drift = dataset_fingerprint_diff(stored_fp, fingerprint)
+            if drift and not cfg.allow_dataset_change:
+                raise SystemExit(
+                    "this checkpoint was trained on a different dataset:\n"
+                    + "\n".join("  - " + d for d in drift)
+                    + "\n\nResuming would reuse a classifier head whose "
+                      "columns mean something else. Point --shards at the "
+                      "corpus it was trained on, start a fresh --out, or pass "
+                      "--allow-dataset-change if you know the labels still "
+                      "line up."
+                )
+            if drift and is_main(rank):
+                log("WARNING: resuming across a dataset change because "
+                    "--allow-dataset-change was given:")
+                for d in drift:
+                    log(f"    {d}")
         load_model_state(model, ckpt["model"])
         if ckpt.get("optimizer"):
             optimizer.load_state_dict(ckpt["optimizer"])
@@ -528,6 +568,7 @@ def train(cfg: V2Config, hours: float | None, resume: bool, log=print) -> int:
     if is_main(rank):
         manager.write_run_json({
             "config": asdict(cfg),
+            "dataset_fingerprint": fingerprint,
             "device": info.as_dict(),
             "world_size": world,
             "git_commit": env.git_commit(),
@@ -601,6 +642,7 @@ def train(cfg: V2Config, hours: float | None, resume: bool, log=print) -> int:
                         manager.save_training_state(
                             model=model, optimizer=optimizer, scheduler=scheduler,
                             scaler=scaler, state=state, config=asdict(cfg),
+                            extra={"dataset_fingerprint": fingerprint},
                         )
                         stop.critical(False)
                         log(f"  checkpoint @ step {state.global_step:,} "
@@ -643,12 +685,15 @@ def train(cfg: V2Config, hours: float | None, resume: bool, log=print) -> int:
             manager.save_training_state(
                 model=model, optimizer=optimizer, scheduler=scheduler,
                 scaler=scaler, state=state, config=asdict(cfg),
+                extra={"dataset_fingerprint": fingerprint},
             )
             # Only overwrite best.pt on a real improvement: it is what export
             # and evaluation read, and replacing it every epoch would mean the
             # last epoch wins rather than the best one.
             if improved or not manager.best.exists():
-                manager.save_best(model=model, state=state, config=asdict(cfg))
+                manager.save_best(model=model, state=state,
+                                  config=asdict(cfg),
+                                  dataset_fingerprint=fingerprint)
             log(f"epoch {state.epoch} complete"
                 + (f"  (best top1 {state.best_metric:.4f} @ epoch "
                    f"{state.best_epoch})" if state.best_metric > float('-inf') else ""))
@@ -687,6 +732,10 @@ def main(argv=None) -> int:
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--checkpoint-minutes", type=float, default=20.0)
     ap.add_argument("--no-resume", action="store_true")
+    ap.add_argument("--allow-dataset-change", action="store_true",
+                    help="resume even though the shard set's class map "
+                         "or preprocessing differs from the one the "
+                         "checkpoint was trained on")
     ap.add_argument("--no-amp", action="store_true")
     args = ap.parse_args(argv)
 
@@ -697,6 +746,7 @@ def main(argv=None) -> int:
         batch_size=args.batch_size, accum_steps=args.accum_steps,
         epochs=args.epochs, lr=args.lr, workers=args.workers, seed=args.seed,
         checkpoint_minutes=args.checkpoint_minutes, amp=not args.no_amp,
+        allow_dataset_change=args.allow_dataset_change,
     )
     return train(cfg, args.hours, resume=not args.no_resume)
 

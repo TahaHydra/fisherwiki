@@ -210,15 +210,21 @@ class CheckpointManager:
             payload.update(extra)
         return self.save(payload)
 
-    def save_best(self, *, model, state: TrainerState, config: dict) -> Path:
+    def save_best(self, *, model, state: TrainerState, config: dict,
+                  dataset_fingerprint: dict | None = None) -> Path:
         """Weights only: a best-checkpoint is for export and evaluation, and
-        carrying optimizer state would triple its size for no reader."""
+        carrying optimizer state would triple its size for no reader.
+
+        The dataset fingerprint still travels with it. This is the file that
+        gets exported and shipped, and a classifier head is meaningless
+        without the class map that gave its columns their meaning."""
         return self.save(
             {
                 "format": 2,
                 "model": _unwrap(model).state_dict(),
                 "state": state.as_dict(),
                 "config": config,
+                "dataset_fingerprint": dataset_fingerprint,
                 "saved_at": time.time(),
             },
             path=self.best,

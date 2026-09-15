@@ -675,3 +675,49 @@ def write_manifest(root: Path, meta: dict) -> Path:
     tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     tmp.replace(path)
     return path
+
+
+def dataset_fingerprint(root: Path) -> dict:
+    """Identity of a prepared shard set, for a checkpoint to record.
+
+    A checkpoint holds a classifier head of a fixed width whose columns mean
+    whatever the class map said when it was written. Resuming it against a
+    shard set prepared differently - another ``--long-edge``, another class map,
+    a species added - either crashes on a shape mismatch, which is the good
+    case, or trains on silently shifted labels, which is not.
+
+    The class map is hashed rather than embedded: it is 5,237 entries today and
+    every one of them matters, but only the fact that they are unchanged does.
+    """
+    root = Path(root)
+    fingerprint = read_fingerprint(root) or {}
+    cm_path = root / ClassMap.FILENAME
+    class_map_sha = None
+    n_classes = None
+    if cm_path.exists():
+        raw = cm_path.read_bytes()
+        class_map_sha = hashlib.sha256(raw).hexdigest()[:16]
+        n_classes = len(json.loads(raw)["classes"])
+    return {
+        "root": str(root),
+        "preprocessing": fingerprint,
+        "class_map_sha256": class_map_sha,
+        "num_classes": n_classes,
+    }
+
+
+def dataset_fingerprint_diff(stored: dict, current: dict) -> list[str]:
+    """Differences that make a checkpoint and a shard set incompatible.
+
+    ``root`` is deliberately not compared: the same corpus copied onto a rented
+    machine is the same corpus, and refusing to resume because the path changed
+    would break every cloud run.
+    """
+    out = []
+    for key in ("class_map_sha256", "num_classes"):
+        if stored.get(key) != current.get(key):
+            out.append(f"{key}: checkpoint has {stored.get(key)!r}, "
+                       f"shards have {current.get(key)!r}")
+    out.extend("preprocessing." + d for d in fingerprint_diff(
+        stored.get("preprocessing") or {}, current.get("preprocessing") or {}))
+    return out
