@@ -5,9 +5,9 @@ Default full run::
 
     python -u tools/acquire_v2.py --all
 
-Safe to Ctrl+C and re-run.  Discovery checkpoints are persisted per source,
+Safe to Ctrl+C and re-run. Discovery checkpoints are persisted per source,
 candidate insertion is idempotent, image downloads use resumable ``.part``
-files, and V2 split assignment only inserts previously unseen groups.  This
+files, and V2 split assignment only inserts previously unseen groups. This
 command NEVER launches fish detection, crop preparation, shard generation or
 training.
 """
@@ -29,11 +29,12 @@ from fwdata.acquisition import (  # noqa: E402
     DiskReserveReached,
     ScanState,
     fetch_registered_source,
+    pending_count,
     prioritized_species,
     register_candidates,
 )
 from fwdata.config import PATHS, free_space_gb  # noqa: E402
-from fwdata.fetch_images import COLUMNS as INAT_COLUMNS, _row_to_provenance  # noqa: E402
+from fwdata.fetch_images import _row_to_provenance  # noqa: E402
 from fwdata.provenance import ProvenanceDB  # noqa: E402
 from fwdata.sources import commons_media, fathomnet_media, gbif_media  # noqa: E402
 from fwdata.splits_v2 import V2SplitStore  # noqa: E402
@@ -155,11 +156,38 @@ def discover_source(
     return added
 
 
+def _reopen_old_policy_refusals(db: ProvenanceDB, selected: tuple[str, ...]) -> int:
+    """Undo only failures created by the old acquisition-time licence gate.
+
+    Old `fetch_images.py` stored a policy rejection as a *permanent network
+    failure*. Broad acquisition deliberately no longer has that gate, so leaving
+    those rows would make hundreds of thousands of newly selected candidates
+    look permanently dead. HTTP/decode failures remain untouched.
+    """
+    placeholders = ",".join("?" * len(selected))
+    params = [*selected]
+    before = db.con.execute(
+        f"SELECT count(*) FROM fetch_failures f JOIN candidates c USING(candidate_id) "
+        f"WHERE c.source_dataset IN ({placeholders}) AND f.reason='permanent' "
+        "AND lower(f.detail) LIKE 'licence refused:%'",
+        params,
+    ).fetchone()[0]
+    if before:
+        db.con.execute(
+            f"DELETE FROM fetch_failures WHERE candidate_id IN ("
+            f" SELECT c.candidate_id FROM candidates c WHERE c.source_dataset IN ({placeholders})"
+            ") AND reason='permanent' AND lower(detail) LIKE 'licence refused:%'",
+            params,
+        )
+        log(f"reopened {before:,} candidates previously blocked only by licence policy")
+    return int(before)
+
+
 def fetch_source(db: ProvenanceDB, source: str, args) -> dict:
-    total = int(db.con.execute(
-        "SELECT count(*) FROM candidates WHERE source_dataset=?", [source]
-    ).fetchone()[0])
-    with Progress(f"acquire-{source}", total=total, resumable=True) as p:
+    pending = pending_count(db, source)
+    if pending == 0:
+        return {"source": source, "selected": 0, "downloaded": 0, "already_done": 0}
+    with Progress(f"acquire-{source}", total=pending, resumable=True) as p:
         stats = fetch_registered_source(
             db,
             source,
@@ -225,6 +253,7 @@ def main(argv=None) -> int:
     }
     try:
         with ProvenanceDB() as db:
+            report["reopened_policy_refusals"] = _reopen_old_policy_refusals(db, selected)
             if "inaturalist" in selected:
                 report["registered"]["inaturalist"] = register_inaturalist(
                     db, cap=args.inat_cap
