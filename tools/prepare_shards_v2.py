@@ -206,8 +206,19 @@ def prepare_one(job):
             (t_read, t_decode, t_geom, t_encode))
 
 
-def corpus_rows(con, splits, *, only_detected: bool = False, limit=None):
-    """Assigned, un-quarantined images with their primary box, in CAS order."""
+def corpus_rows(con, splits, *, only_detected: bool = False, limit=None,
+                prefer_source: str | None = None):
+    """Assigned, un-quarantined images with their primary box, in CAS order.
+
+    ``prefer_source`` handles the re-fetch case. Pulling the corpus again at
+    1024 px stores a second file for the same photograph - different bytes,
+    different sha, same iNaturalist photo id - and both get assigned to the same
+    observation group, because that is what keeps splits immutable. Preparing
+    both would put two resolutions of one photo in the same split: not a leak,
+    but redundant data the model sees twice. Naming the preferred source drops
+    the superseded copy at selection time rather than after the pixels are
+    written.
+    """
     has_detections = con.execute(
         "SELECT count(*) FROM information_schema.tables WHERE table_name='detections'"
     ).fetchone()[0] > 0
@@ -221,6 +232,17 @@ def corpus_rows(con, splits, *, only_detected: bool = False, limit=None):
     detect_filter = (
         "AND EXISTS (SELECT 1 FROM detections dd WHERE dd.sha256 = m.sha256)"
         if (only_detected and has_detections) else "")
+    supersede = ""
+    if prefer_source:
+        supersede = f"""
+          AND NOT EXISTS (
+              SELECT 1 FROM provenance better
+              WHERE better.source_record_id = p.source_record_id
+                AND better.source_dataset = '{prefer_source}'
+                AND p.source_dataset <> '{prefer_source}'
+                AND EXISTS (SELECT 1 FROM split_group_members bm
+                            WHERE bm.sha256 = better.sha256
+                              AND bm.dataset_version = m.dataset_version))"""
     placeholders = ",".join("?" * len(splits))
     rows = con.execute(
         f"""
@@ -246,7 +268,7 @@ def corpus_rows(con, splits, *, only_detected: bool = False, limit=None):
           AND NOT EXISTS (
               SELECT 1 FROM split_quarantine q
               WHERE q.dataset_version = m.dataset_version AND q.sha256 = m.sha256)
-          {detect_filter}
+          {detect_filter}{supersede}
         GROUP BY m.sha256, g.split, g.taxon_id, g.group_id
         -- On-disk order, not logical order. See the module docstring: the CAS
         -- is cas/ab/cd/<sha>, so split/taxon order is a seek per image while
@@ -294,6 +316,7 @@ def build(
     whole_frame_fraction: float = 0.15,
     min_crop_px: int = 224,
     only_detected: bool = False,
+    prefer_source: str | None = None,
     workers: int = 6,
     chunk: int = 16,
     adopt_fingerprint: bool = False,
@@ -342,7 +365,7 @@ def build(
     try:
         if rows is None:
             rows = corpus_rows(con, splits, only_detected=only_detected,
-                               limit=limit)
+                               limit=limit, prefer_source=prefer_source)
     finally:
         con.close()
     if not rows:
@@ -533,6 +556,10 @@ def main(argv=None) -> int:
                     help="declare that shards already in --out were produced "
                          "with these exact settings, for a directory written "
                          "before fingerprints existed")
+    ap.add_argument("--prefer-source", default=None,
+                    help="when the same source photo exists under two source "
+                         "datasets (a 500px and a 1024px fetch of the same "
+                         "iNaturalist photo), prepare only this one")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--splits", default=",".join(SPLITS))
     args = ap.parse_args(argv)
@@ -543,6 +570,7 @@ def main(argv=None) -> int:
         shard_size=args.shard_size, limit=args.limit, crop_pad=args.crop_pad,
         whole_frame_fraction=args.whole_frame_fraction,
         min_crop_px=args.min_crop_px, only_detected=args.only_detected,
+        prefer_source=args.prefer_source,
         workers=args.workers, chunk=args.chunk,
         adopt_fingerprint=args.adopt_fingerprint,
         splits=tuple(s.strip() for s in args.splits.split(",") if s.strip()),

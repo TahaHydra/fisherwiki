@@ -21,3 +21,15 @@ def tmp_data_root(tmp_path, monkeypatch):
     paths = config.Paths(tmp_path).ensure()
     monkeypatch.setattr(config, "PATHS", paths)
     return paths
+
+
+@pytest.fixture(autouse=True)
+def isolated_work_dir(tmp_path_factory, monkeypatch):
+    """Keep test progress out of the live D: status directory.
+
+    Without this, a test that runs a stage writes work/status/prepare.json into
+    the real data root, and `tools/status.py` then reports a twelve-image test
+    fixture as the state of the corpus.
+    """
+    monkeypatch.setenv("FISHERWIKI_WORK",
+                       str(tmp_path_factory.mktemp("work")))

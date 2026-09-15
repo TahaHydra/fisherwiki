@@ -27,9 +27,27 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-WORK = Path(os.environ.get("FISHERWIKI_WORK", r"D:\fisherwiki-data\work"))
-STATUS_DIR = WORK / "status"
-LOG_DIR = WORK / "logs"
+DEFAULT_WORK = Path(r"D:\fisherwiki-data\work")
+
+
+def work_dir() -> Path:
+    """Resolved per call, not bound at import.
+
+    A module-level constant reads ``FISHERWIKI_WORK`` once, at whichever moment
+    the first import happens - so a test that sets it afterwards silently wrote
+    its progress into the live ``D:`` status directory, where it then showed up
+    in ``tools/status.py`` as a real run. Same shape as the ``PATHS`` binding
+    bug that had tests writing into the production artifact store.
+    """
+    return Path(os.environ.get("FISHERWIKI_WORK") or DEFAULT_WORK)
+
+
+def status_dir() -> Path:
+    return work_dir() / "status"
+
+
+def log_dir() -> Path:
+    return work_dir() / "logs"
 
 #: Don't rewrite the status file on every image; it is read by humans, not by
 #: code, and a 500 MB/s NVMe still has better things to do 200 times a second.
@@ -75,10 +93,12 @@ class Progress:
         self.started = time.time()
         self._last_write = 0.0
         self._log_fh = None
+        self.status_dir = status_dir()
+        self.log_dir = log_dir()
         try:
-            STATUS_DIR.mkdir(parents=True, exist_ok=True)
-            LOG_DIR.mkdir(parents=True, exist_ok=True)
-            self._log_fh = open(LOG_DIR / f"{stage}.log", "a",
+            self.status_dir.mkdir(parents=True, exist_ok=True)
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            self._log_fh = open(self.log_dir / f"{stage}.log", "a",
                                 encoding="utf-8", buffering=1)
         except OSError:
             self._log_fh = None
@@ -137,7 +157,7 @@ class Progress:
         if not force and now - self._last_write < MIN_WRITE_INTERVAL:
             return
         self._last_write = now
-        path = STATUS_DIR / f"{self.stage}.json"
+        path = self.status_dir / f"{self.stage}.json"
         tmp = Path(str(path) + ".tmp")
         try:
             tmp.write_text(json.dumps(self.snapshot(), indent=2), encoding="utf-8")
@@ -173,7 +193,7 @@ class Progress:
 
 
 def read_status(stage: str) -> dict | None:
-    path = STATUS_DIR / f"{stage}.json"
+    path = status_dir() / f"{stage}.json"
     if not path.exists():
         return None
     try:
@@ -183,10 +203,11 @@ def read_status(stage: str) -> dict | None:
 
 
 def all_status() -> list[dict]:
-    if not STATUS_DIR.exists():
+    root = status_dir()
+    if not root.exists():
         return []
     out = []
-    for path in sorted(STATUS_DIR.glob("*.json")):
+    for path in sorted(root.glob("*.json")):
         try:
             out.append(json.loads(path.read_text(encoding="utf-8")))
         except (OSError, ValueError):

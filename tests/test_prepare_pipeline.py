@@ -253,3 +253,45 @@ class TestDraftDecode:
         _build(drafted, corpus, workers=0, decode_draft=True)
         assert read_fingerprint(full)["decode_draft"] is False
         assert read_fingerprint(drafted)["decode_draft"] is True
+
+
+class TestSupersededResolutions:
+    def test_prefer_source_drops_the_lower_resolution_copy(self, corpus, tmp_path):
+        """After a 1024px re-fetch, the same photograph exists twice: two files,
+        two sha256s, one observation group. Preparing both would put two
+        resolutions of one photo in the same split."""
+        import duckdb
+
+        import prepare_shards_v2 as prep
+
+        # Re-fetch image 0 at a larger size: same source photo id, new bytes.
+        con = duckdb.connect(str(corpus["db"]))
+        old = con.execute("SELECT sha256, cas_path, accepted_scientific_name, "
+                          "species_taxon_id FROM provenance "
+                          "ORDER BY sha256 LIMIT 1").fetchone()
+        con.execute("ALTER TABLE provenance ADD COLUMN source_dataset VARCHAR")
+        con.execute("ALTER TABLE provenance ADD COLUMN source_record_id VARCHAR")
+        con.execute("UPDATE provenance SET source_dataset='inaturalist', "
+                    "source_record_id=sha256")
+        big = "f" * 64
+        con.execute("INSERT INTO provenance VALUES (?, ?, ?, ?, ?, ?)",
+                    [big, old[1], old[2], old[3], "inaturalist-large", old[0]])
+        group = con.execute("SELECT group_id FROM split_group_members "
+                            "WHERE sha256 = ?", [old[0]]).fetchone()[0]
+        con.execute("INSERT INTO split_group_members VALUES ('v2', ?, ?)",
+                    [group, big])
+        con.close()
+
+        con = duckdb.connect(str(corpus["db"]), read_only=True)
+        try:
+            both = prep.corpus_rows(con, SPLITS)
+            preferred = prep.corpus_rows(con, SPLITS,
+                                         prefer_source="inaturalist-large")
+        finally:
+            con.close()
+
+        assert len(both) == N_IMAGES + 1, "precondition: both copies are assigned"
+        keys = {r[0] for r in preferred}
+        assert len(preferred) == N_IMAGES
+        assert big in keys, "the large copy should be the one kept"
+        assert old[0] not in keys, "the superseded 500px copy was still prepared"
