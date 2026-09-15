@@ -82,6 +82,163 @@ class Sample:
     group_id: str
 
 
+#: Bumped whenever the *pixels* a sample contains change for the same
+#: arguments. Not a code version - a semantics version. Reordering the CAS
+#: walk or moving encoding into worker processes leaves this alone; changing
+#: the resampling filter, the crop maths or the decoder path does not.
+#:
+#: 1  full decode, LANCZOS to long edge, JPEG optimize=True
+#: 2  DCT-domain draft decode before LANCZOS, JPEG optimize=False
+PREP_IMPL_VERSION = 2
+
+#: Keys of the preprocessing fingerprint. Two shard sets whose fingerprints
+#: agree on every one of these hold interchangeable pixels; two that differ on
+#: any of them do not, and must never end up in the same corpus.
+FINGERPRINT_KEYS = (
+    "prep_impl_version", "dataset_version", "long_edge", "jpeg_quality",
+    "jpeg_optimize", "jpeg_progressive", "crop_pad", "min_crop_px",
+    "whole_frame_fraction", "resample", "decode_draft", "shard_size",
+)
+
+
+class FingerprintMismatch(RuntimeError):
+    """A resume would have mixed two different preprocessing configurations."""
+
+
+def fingerprint_path(root: Path) -> Path:
+    return Path(root) / "prepare_fingerprint.json"
+
+
+def read_fingerprint(root: Path) -> dict | None:
+    path = fingerprint_path(root)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def write_fingerprint(root: Path, fingerprint: dict) -> Path:
+    path = fingerprint_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(fingerprint, indent=2, sort_keys=True),
+                   encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def fingerprint_diff(stored: dict, wanted: dict) -> list[str]:
+    """Human-readable list of the keys on which two fingerprints disagree."""
+    out = []
+    for key in FINGERPRINT_KEYS:
+        a, b = stored.get(key, "<absent>"), wanted.get(key, "<absent>")
+        if a != b:
+            out.append(f"{key}: existing shards used {a!r}, this run wants {b!r}")
+    return out
+
+
+def check_fingerprint(root: Path, wanted: dict, *, has_work: bool) -> dict | None:
+    """Refuse to append to a shard set built with different preprocessing.
+
+    The failure this prevents is silent and expensive: resume skips samples by
+    *key*, and a key says nothing about the pixels behind it. Changing
+    ``--long-edge`` and re-running would therefore keep every old shard, skip
+    every sample in it, and produce one corpus containing two different
+    preprocessing configurations - a corpus that trains, converges, and is
+    quietly wrong.
+
+    Returns the stored fingerprint, or ``None`` when the directory is new.
+    """
+    stored = read_fingerprint(root)
+    if stored is None:
+        if has_work:
+            raise FingerprintMismatch(
+                f"{root} already contains finalised shards but no "
+                f"{fingerprint_path(root).name}.\n"
+                "They were written before preprocessing fingerprints existed, "
+                "so there is no record of the settings that produced them and "
+                "they cannot be safely appended to.\n"
+                "Either prepare into a fresh --out directory, or, if you know "
+                "the settings match, declare them with --adopt-fingerprint."
+            )
+        return None
+    diff = fingerprint_diff(stored, wanted)
+    if diff:
+        raise FingerprintMismatch(
+            f"preprocessing settings differ from the shards already in "
+            f"{root}:\n"
+            + "\n".join("  - " + d for d in diff)
+            + "\n\nRefusing to mix two preprocessing configurations in one "
+              "corpus. Prepare into a fresh --out directory, or restore the "
+              "settings above."
+        )
+    return stored
+
+
+class ClassMap:
+    """Append-only taxon id -> dense class id, persisted beside the shards.
+
+    Deriving class ids from whatever taxa happen to be in the corpus - which is
+    what the first implementation did, sorting by scientific name - makes them
+    move every time a species is added. A shard written last week then means a
+    different label than the same integer written today, and nothing detects
+    it. Assignments here are permanent: new taxa take the next free id, and a
+    taxon that has an id keeps it forever.
+    """
+
+    FILENAME = "class_map.json"
+
+    def __init__(self, root: Path) -> None:
+        self.root = Path(root)
+        self.path = self.root / self.FILENAME
+        self.by_taxon: dict[int, int] = {}
+        self.names: dict[int, str] = {}
+        if self.path.exists():
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            for entry in raw["classes"]:
+                self.by_taxon[int(entry["taxon_id"])] = int(entry["class_id"])
+                self.names[int(entry["taxon_id"])] = entry.get("scientific_name")
+
+    def extend(self, taxa) -> int:
+        """Give every unseen taxon the next id, in name order. Returns how many.
+
+        ``taxa`` is normally one entry per *image*, so it is deduplicated first:
+        without that, a species with 400 photos consumed 400 class ids.
+        """
+        seen: dict[int, str | None] = {}
+        for taxon_id, name in taxa:
+            seen.setdefault(int(taxon_id), name)
+        fresh = sorted((t for t in seen.items() if t[0] not in self.by_taxon),
+                       key=lambda t: (t[1] or "", t[0]))
+        nxt = max(self.by_taxon.values(), default=-1) + 1
+        for taxon_id, name in fresh:
+            self.by_taxon[taxon_id] = nxt
+            self.names[taxon_id] = name
+            nxt += 1
+        for taxon_id, name in seen.items():
+            self.names.setdefault(taxon_id, name)
+        return len(fresh)
+
+    def __getitem__(self, taxon_id: int) -> int:
+        return self.by_taxon[int(taxon_id)]
+
+    def __len__(self) -> int:
+        return len(self.by_taxon)
+
+    def save(self) -> Path:
+        payload = {"classes": [
+            {"class_id": c, "taxon_id": t, "scientific_name": self.names.get(t)}
+            for t, c in sorted(self.by_taxon.items(), key=lambda kv: kv[1])
+        ]}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = Path(str(self.path) + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(self.path)
+        return self.path
+
+
 def shard_sidecar(shard_path: Path) -> Path:
     """Durable per-shard index, written when that shard is finalised."""
     return Path(str(shard_path) + ".idx.parquet")
@@ -166,6 +323,41 @@ def adopt_shard(shard_path: Path, lookup) -> int:
     if rows:
         _write_table(rows, shard_sidecar(shard_path))
     return len(rows)
+
+
+def relabel_sidecars(out_dir: Path, class_of: dict) -> int:
+    """Re-derive every sidecar's ``class_id`` from its ``taxon_id``.
+
+    A class id is a dense index into the current class map; a taxon id is a
+    fact about the fish. Storing the first in a shard written months ago and
+    then adding a species is how a corpus ends up with two meanings for the
+    integer 41 - and nothing downstream can tell, because both are plausible
+    small numbers.
+
+    Taxon ids in a sidecar are authoritative, so the labels are always
+    recoverable: this rewrites the derived column and leaves everything else
+    alone. Returns the number of shards whose labels actually moved.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    changed = 0
+    for shard in sorted(Path(out_dir).glob("*.tar")):
+        side = shard_sidecar(shard)
+        if not side.exists():
+            continue
+        table = pq.read_table(side)
+        taxa = table.column("taxon_id").to_pylist()
+        want = [int(class_of[t]) for t in taxa]
+        if want == table.column("class_id").to_pylist():
+            continue
+        cols = {c: table.column(c) for c in INDEX_COLUMNS}
+        cols["class_id"] = pa.array(want)
+        tmp = Path(str(side) + ".tmp")
+        pq.write_table(pa.table(cols), tmp, compression="zstd")
+        tmp.replace(side)
+        changed += 1
+    return changed
 
 
 def rebuild_index(out_dir: Path) -> Path:
