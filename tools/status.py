@@ -8,15 +8,6 @@ Reads the durable state every stage leaves behind - status files under
 ``work/status``, shard sidecars, checkpoint directories, the provenance
 database - and prints one screen showing what is running, how far it got, and
 whether stopping now would lose anything.
-
-This exists because the last long run's only progress record was the scrollback
-of a background shell owned by an assistant session. When the session ended the
-run was invisible: still going, no way to see how far, and no way to know
-whether killing it was safe. Nothing in this project should ever be in that
-position again.
-
-Every read here is cheap and non-locking. It is safe to run while a job is
-going, and safe to run when nothing is.
 """
 
 from __future__ import annotations
@@ -38,8 +29,8 @@ from fwml.progress import all_status, log_dir, status_dir  # noqa: E402
 
 #: Anything whose command line mentions one of these is one of ours.
 OUR_SCRIPTS = ("prepare_shards_v2", "detect_fish", "v2_pipeline", "fetch_images",
-               "dataset.py", "train_v2", "pilot_backbone", "gbif_census",
-               "refetch_large")
+               "acquire_v2", "dataset.py", "train_v2", "pilot_backbone",
+               "gbif_census", "refetch_large")
 
 SHARD_ROOTS = (Path(r"E:\FisherWiki\shards\v2"), Path(r"D:\fisherwiki-data\v2\shards"))
 CHECKPOINT_ROOTS = (Path(r"E:\FisherWiki\runs"), PATHS.root / "runs")
@@ -128,8 +119,6 @@ def corpus_state() -> dict | None:
     try:
         con = duckdb.connect(str(PATHS.provenance_db), read_only=True)
     except Exception:
-        # A writer holds the file. Not an error worth shouting about - the
-        # running-jobs section above already says who.
         return {"locked": True}
     try:
         def one(sql, default=0):
@@ -140,16 +129,13 @@ def corpus_state() -> dict | None:
         return {
             "images": one("SELECT count(DISTINCT sha256) FROM provenance"),
             "detected": one("SELECT count(DISTINCT sha256) FROM detections"),
-            "assigned": one("SELECT count(*) FROM split_group_members "
-                            "WHERE dataset_version='v2'"),
-            "species": one("SELECT count(DISTINCT species_taxon_id) FROM provenance "
-                           "WHERE species_taxon_id IS NOT NULL"),
+            "assigned": one("SELECT count(*) FROM split_group_members WHERE dataset_version='v2'"),
+            "species": one("SELECT count(DISTINCT species_taxon_id) FROM provenance WHERE species_taxon_id IS NOT NULL"),
             "pending_detection": one(
                 "SELECT count(*) FROM (SELECT DISTINCT p.sha256 FROM provenance p "
                 "WHERE p.cas_path IS NOT NULL AND NOT EXISTS "
                 "(SELECT 1 FROM detections d WHERE d.sha256=p.sha256))"),
-            "quarantined": one("SELECT count(*) FROM split_quarantine "
-                               "WHERE dataset_version='v2'"),
+            "quarantined": one("SELECT count(*) FROM split_quarantine WHERE dataset_version='v2'"),
         }
     finally:
         con.close()
@@ -191,7 +177,7 @@ def render() -> None:
         for pid, what in jobs:
             print(f"  pid {pid:<8} {what}")
     else:
-        print("  nothing - no preparation, detection, fetch or training process")
+        print("  nothing - no acquisition, preparation, detection, fetch or training process")
 
     print("\nSTAGES (from work/status)")
     entries = all_status()
@@ -228,10 +214,8 @@ def render() -> None:
     else:
         print(f"  images in CAS      {corpus['images']:>10,}")
         print(f"  species            {corpus['species']:>10,}")
-        print(f"  detected           {corpus['detected']:>10,}   "
-              f"pending {corpus['pending_detection']:,}")
-        print(f"  assigned to splits {corpus['assigned']:>10,}   "
-              f"quarantined {corpus['quarantined']:,}")
+        print(f"  detected           {corpus['detected']:>10,}   pending {corpus['pending_detection']:,}")
+        print(f"  assigned to splits {corpus['assigned']:>10,}   quarantined {corpus['quarantined']:,}")
 
     print("\nPREPARED SHARDS")
     any_shards = False
@@ -258,31 +242,25 @@ def render() -> None:
     if not cps:
         print("  no training run has checkpointed yet")
     for c in cps:
-        print(f"  {c['run']:<24} {', '.join(c['have'])}  "
-              f"(written {duration(c['age_s'])} ago)")
+        print(f"  {c['run']:<24} {', '.join(c['have'])}  (written {duration(c['age_s'])} ago)")
         st = c.get("state") or {}
         if st:
-            print(f"      epoch {st.get('epoch')}  step {st.get('global_step')}  "
-                  f"best {st.get('best_metric')}")
+            print(f"      epoch {st.get('epoch')}  step {st.get('global_step')}  best {st.get('best_metric')}")
 
     print("\nDISK")
     for drive, free, total in disks():
         reserve = 50 if drive == "D:" else 30
         flag = "  LOW" if free < reserve else ""
-        print(f"  {drive} {free:6.1f} GB free of {total:6.1f} GB "
-              f"(reserve {reserve} GB){flag}")
+        print(f"  {drive} {free:6.1f} GB free of {total:6.1f} GB (reserve {reserve} GB){flag}")
 
     print(f"\nlogs: {log_dir()}    status: {status_dir()}")
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--watch", action="store_true",
-                    help="redraw every --interval seconds until interrupted")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--watch", action="store_true", help="redraw every --interval seconds until interrupted")
     ap.add_argument("--interval", type=float, default=15.0)
-    ap.add_argument("--json", action="store_true",
-                    help="machine-readable dump instead of the screen")
+    ap.add_argument("--json", action="store_true", help="machine-readable dump instead of the screen")
     args = ap.parse_args(argv)
 
     if args.json:
