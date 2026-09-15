@@ -183,6 +183,29 @@ def _reopen_old_policy_refusals(db: ProvenanceDB, selected: tuple[str, ...]) -> 
     return int(before)
 
 
+def _prefer_large_inaturalist_for_pending(db: ProvenanceDB) -> int:
+    """Use iNaturalist's 1024px derivative for newly acquired photos.
+
+    The historical CAS remains untouched. Only candidates that have never been
+    stored are rewritten from /medium (500px) to /large (1024px), preventing a
+    new million-image acquisition from immediately needing the same refetch job
+    we already queued for the old corpus.
+    """
+    before = db.con.execute(
+        "SELECT count(*) FROM candidates c WHERE c.source_dataset='inaturalist' "
+        "AND c.image_url LIKE '%/medium.%' "
+        "AND NOT EXISTS (SELECT 1 FROM stored s WHERE s.candidate_id=c.candidate_id)"
+    ).fetchone()[0]
+    if before:
+        db.con.execute(
+            "UPDATE candidates SET image_url=replace(image_url, '/medium.', '/large.') "
+            "WHERE source_dataset='inaturalist' AND image_url LIKE '%/medium.%' "
+            "AND NOT EXISTS (SELECT 1 FROM stored s WHERE s.candidate_id=candidates.candidate_id)"
+        )
+        log(f"upgraded {before:,} pending iNaturalist URLs from 500px to 1024px")
+    return int(before)
+
+
 def fetch_source(db: ProvenanceDB, source: str, args) -> dict:
     pending = pending_count(db, source)
     if pending == 0:
@@ -258,6 +281,7 @@ def main(argv=None) -> int:
                 report["registered"]["inaturalist"] = register_inaturalist(
                     db, cap=args.inat_cap
                 )
+                report["pending_inaturalist_large_urls"] = _prefer_large_inaturalist_for_pending(db)
             for source in selected:
                 if source == "inaturalist":
                     continue
