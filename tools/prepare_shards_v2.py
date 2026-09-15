@@ -564,6 +564,19 @@ def main(argv=None) -> int:
     ap.add_argument("--splits", default=",".join(SPLITS))
     args = ap.parse_args(argv)
 
+    from fwml.shards import FingerprintMismatch
+
+    try:
+        return _build_from_args(args)
+    except FingerprintMismatch as exc:
+        # A refused resume is an operator mistake with a one-line fix, not a
+        # crash. A stack trace here buries the line that says which parameter
+        # moved, which is the only part worth reading.
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 2
+
+
+def _build_from_args(args) -> int:
     build(
         Path(args.out), long_edge=args.long_edge, quality=args.quality,
         jpeg_optimize=args.jpeg_optimize, decode_draft=args.decode_draft,
